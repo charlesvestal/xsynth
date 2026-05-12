@@ -252,9 +252,14 @@ impl SampleSoundfont {
             .map(sample_cache_from_region_params)
             .collect();
 
-        // Parse and convert them in parallel
+        // MOVE FORK: sample loading is sequential on Move. The original
+        // `into_par_iter()` decodes every sample via rayon at once, which on
+        // 452-sample patches (WörliTzer) ballooned peak memory and aborted
+        // the process via Rust's alloc handler on our ~1.5 GB device. Serial
+        // load keeps peak well under budget; render-time rayon parallelism
+        // is untouched.
         let samples: Result<HashMap<_, _>, _> = unique_sample_params
-            .into_par_iter()
+            .into_iter()
             .map(|params| -> Result<(_, _), LoadSfzError> {
                 let sample = load_audio_file(&params.path, stream_params)?;
                 Ok((params, sample))
