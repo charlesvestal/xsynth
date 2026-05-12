@@ -24,6 +24,7 @@ mod voice_spawner;
 
 mod event;
 pub use event::*;
+pub use channel_sf::SoundfontDropSink;
 
 pub(crate) use control::ValueLerp;
 pub use params::VoiceChannelStatsReader;
@@ -317,6 +318,11 @@ impl VoiceChannel {
     pub fn get_channel_stats(&self) -> VoiceChannelStatsReader {
         let stats = self.params.stats.clone();
         VoiceChannelStatsReader::new(stats)
+    }
+
+    /// MOVE FORK: register a deferred-drop sink (see channel_sf::SoundfontDropSink).
+    pub fn set_soundfont_drop_sink(&mut self, sink: SoundfontDropSink) {
+        self.params.channel_sf.set_drop_sink(sink);
     }
 }
 

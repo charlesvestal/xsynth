@@ -211,6 +211,13 @@ impl ChannelGroup {
             .map(|c| c.get_channel_stats().voice_count())
             .sum()
     }
+
+    /// MOVE FORK: install a deferred-drop sink across all channels.
+    pub fn set_soundfont_drop_sink(&mut self, sink: crate::channel::SoundfontDropSink) {
+        for c in self.channels.iter_mut() {
+            c.set_soundfont_drop_sink(sink.clone());
+        }
+    }
 }
 
 impl AudioPipe for ChannelGroup {

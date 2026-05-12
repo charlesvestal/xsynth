@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use biquad::Q_BUTTERWORTH_F32;
@@ -184,6 +187,10 @@ pub enum LoadSfzError {
 
     #[error("Error parsing the SFZ: {0}")]
     SfzParseError(#[from] SfzParseError),
+
+    /// MOVE FORK: cancellation signal observed.
+    #[error("Load was cancelled")]
+    Cancelled,
 }
 
 /// Errors that can be generated when loading a soundfont
@@ -231,20 +238,40 @@ impl SampleSoundfont {
         }
     }
 
+    /// MOVE FORK: cancellable variant. Pass an AtomicBool that the caller can
+    /// flip to abort the load between sample decodes.
+    pub fn new_sfz_cancellable(
+        sfz_path: impl Into<PathBuf>,
+        stream_params: AudioStreamParams,
+        options: SoundfontInitOptions,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, LoadSfzError> {
+        Self::new_sfz_inner(sfz_path.into(), stream_params, options, cancel)
+    }
+
     /// Loads a new SFZ soundfont
-    ///
-    /// Parameters:
-    /// - `path`: The path of the SFZ soundfont to be loaded.
-    /// - `stream_params`: Parameters of the output audio. See the `AudioStreamParams`
-    ///   documentation for the available options.
-    /// - `options`: The soundfont configuration. See the `SoundfontInitOptions`
-    ///   documentation for the available options.
     pub fn new_sfz(
         sfz_path: impl Into<PathBuf>,
         stream_params: AudioStreamParams,
         options: SoundfontInitOptions,
     ) -> Result<Self, LoadSfzError> {
-        let regions = xsynth_soundfonts::sfz::parse_soundfont(sfz_path.into())?;
+        Self::new_sfz_inner(sfz_path.into(), stream_params, options, None)
+    }
+
+    fn new_sfz_inner(
+        sfz_path: PathBuf,
+        stream_params: AudioStreamParams,
+        options: SoundfontInitOptions,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, LoadSfzError> {
+        let check_cancel = || -> Result<(), LoadSfzError> {
+            if let Some(c) = &cancel {
+                if c.load(Ordering::Relaxed) { return Err(LoadSfzError::Cancelled); }
+            }
+            Ok(())
+        };
+        check_cancel()?;
+        let regions = xsynth_soundfonts::sfz::parse_soundfont(sfz_path)?;
 
         // Find the unique samples that we need to parse and convert
         let unique_sample_params: HashSet<_> = regions
@@ -261,6 +288,7 @@ impl SampleSoundfont {
         let samples: Result<HashMap<_, _>, _> = unique_sample_params
             .into_iter()
             .map(|params| -> Result<(_, _), LoadSfzError> {
+                check_cancel()?;
                 let sample = load_audio_file(&params.path, stream_params)?;
                 Ok((params, sample))
             })

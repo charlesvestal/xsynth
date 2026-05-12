@@ -1,4 +1,4 @@
-use std::{iter, ops::Deref, sync::Arc};
+use std::{iter, ops::Deref, sync::{Arc, Mutex}};
 
 use crate::{
     helpers::are_arc_vecs_equal,
@@ -7,6 +7,11 @@ use crate::{
 };
 
 use super::voice_spawner::VoiceSpawnerMatrix;
+
+/// MOVE FORK: deferred-drop sink. set_soundfonts pushes the OLD vec here
+/// rather than letting it drop inline on the audio thread (which can take
+/// 100 ms+ for a heavy DS library).
+pub type SoundfontDropSink = Arc<Mutex<Vec<Arc<dyn SoundfontBase>>>>;
 
 #[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct ProgramDescriptor {
@@ -18,6 +23,7 @@ pub struct ChannelSoundfont {
     soundfonts: Vec<Arc<dyn SoundfontBase>>,
     matrix: VoiceSpawnerMatrix,
     curr_program: ProgramDescriptor,
+    drop_sink: Option<SoundfontDropSink>,
 }
 
 impl Deref for ChannelSoundfont {
@@ -35,12 +41,22 @@ impl ChannelSoundfont {
             soundfonts: Vec::new(),
             matrix: VoiceSpawnerMatrix::new(),
             curr_program: Default::default(),
+            drop_sink: None,
         }
+    }
+
+    pub fn set_drop_sink(&mut self, sink: SoundfontDropSink) {
+        self.drop_sink = Some(sink);
     }
 
     pub fn set_soundfonts(&mut self, soundfonts: Vec<Arc<dyn SoundfontBase>>) {
         if !are_arc_vecs_equal(&self.soundfonts, &soundfonts) {
-            self.soundfonts = soundfonts;
+            let old = std::mem::replace(&mut self.soundfonts, soundfonts);
+            if let Some(sink) = &self.drop_sink {
+                if let Ok(mut q) = sink.lock() {
+                    q.extend(old);
+                }
+            }
             self.rebuild_matrix();
         }
     }
