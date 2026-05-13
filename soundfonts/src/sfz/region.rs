@@ -106,6 +106,14 @@ pub(crate) struct RegionParamsBuilder {
     /// aren't satisfied are dropped entirely so they don't play
     /// unconditionally. Default empty = unconstrained.
     cc_ranges: HashMap<u8, (u8, u8)>,
+    /// MOVE FORK: live `volume_oncc<N>=<dB>` bindings collected on this
+    /// region. Each entry is (CC number, dB delta-per-unit). A future
+    /// voice-side generator multiplies the voice amp by
+    /// `db_to_amp(Σ delta·cc/127)`. Currently UNUSED at the call site —
+    /// xsynth-core's voice spawners don't read this yet. Field exists so
+    /// the parser/region/builder data path is in place before runtime
+    /// support lands.
+    volume_oncc: Vec<(u8, f32)>,
 }
 
 impl Default for RegionParamsBuilder {
@@ -142,6 +150,7 @@ impl Default for RegionParamsBuilder {
             seq_length: 0,
             seq_position: 0,
             cc_ranges: HashMap::new(),
+            volume_oncc: Vec::new(),
         }
     }
 }
@@ -191,6 +200,17 @@ impl RegionParamsBuilder {
             SfzOpcode::HiCc(n, v) => {
                 let entry = self.cc_ranges.entry(n).or_insert((0, 127));
                 entry.1 = v;
+            }
+            // MOVE FORK: collect live volume_oncc bindings on this region.
+            // Duplicate CCs replace the prior delta (SFZ "last assignment
+            // wins"). Different CCs accumulate so a single region can be
+            // modulated by multiple knobs at once.
+            SfzOpcode::VolumeOncc(cc, db) => {
+                if let Some(existing) = self.volume_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = db;
+                } else {
+                    self.volume_oncc.push((cc, db));
+                }
             }
             // MOVE FORK: ARIA opcodes are resolved in parse_sf_root, not
             // here. If one reaches update_from_flag it means the parent
@@ -262,6 +282,7 @@ impl RegionParamsBuilder {
             trigger: self.trigger,
             seq_length: self.seq_length,
             seq_position: self.seq_position,
+            volume_oncc: self.volume_oncc,
         })
     }
 }
@@ -300,6 +321,11 @@ pub struct RegionParams {
     /// for RR rotation).
     pub seq_length: u32,
     pub seq_position: u32,
+    /// MOVE FORK: live `volume_oncc<N>=<dB>` bindings. See
+    /// RegionParamsBuilder.volume_oncc for semantics. Unread by
+    /// xsynth-core today — will be consumed by a SIMD generator in a
+    /// later Phase 3 step.
+    pub volume_oncc: Vec<(u8, f32)>,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {

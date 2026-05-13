@@ -74,6 +74,12 @@ pub enum SfzOpcode {
     LoCc(u8, u8),
     /// MOVE FORK: `hicc<N>=<v>` — region/group only fires when CC<N> ≤ v.
     HiCc(u8, u8),
+    /// MOVE FORK: `volume_oncc<N>=<dB>` — live volume modulation. Stored
+    /// on the region (not folded into a static value at load time) so a
+    /// future SIMD generator can sample CC<N> each block and apply
+    /// `db_to_amp(delta·cc/127)`. Multiple opcodes for the same region
+    /// accumulate; duplicate CCs follow SFZ "last assignment wins".
+    VolumeOncc(u8, f32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -324,16 +330,25 @@ fn parse_sfz_opcode(
         return Ok(None);
     }
 
-    // MOVE FORK: ARIA `<base>_oncc<N>` modulator. parse_sf_root resolves
-    // the CC value and adds the scaled contribution to the base opcode.
-    // We only recognize a closed set of base names (ampeg_*) — others are
-    // silently ignored, matching xsynth's previous behavior for unknown
-    // opcodes. `_curvecc` variants also silently fall through (no curve
-    // support; using a linear approximation as if curve=0).
+    // MOVE FORK: ARIA `<base>_oncc<N>` modulator.
+    //  - ampeg_*: parse_sf_root resolves the CC value and adds the
+    //    scaled contribution to the base opcode at load time (static
+    //    bake — knob position frozen at load).
+    //  - volume: stored as a live binding on the region; a future SIMD
+    //    generator can sample CC<N> each block.
+    //  - others: silently dropped (matches xsynth's previous behavior).
+    // `_curvecc` variants also silently fall through (no curve support).
     if let Some(idx) = name.find("_oncc") {
         let base_name = &name[..idx];
         let cc_part = &name[idx + "_oncc".len()..];
         if let Ok(cc_n) = cc_part.parse::<u8>() {
+            // Live binding: stored on the region, sampled at render time.
+            if base_name == "volume" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(VolumeOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
             let base = match base_name {
                 "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
                 "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
