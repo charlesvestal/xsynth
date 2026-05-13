@@ -19,11 +19,12 @@ impl KeyData {
     pub fn new(
         key: u8,
         shared_voice_counter: Arc<AtomicU64>,
+        shared_group_id: Arc<AtomicU64>,
         options: ChannelInitOptions,
     ) -> KeyData {
         KeyData {
             key,
-            voices: VoiceBuffer::new(options),
+            voices: VoiceBuffer::new(options, shared_group_id),
             last_voice_count: 0,
             shared_voice_counter,
         }
@@ -96,5 +97,16 @@ impl KeyData {
 
     pub fn kill_by_exclusive_class(&mut self, class: u8) {
         self.voices.kill_by_exclusive_class(class);
+    }
+
+    /// MOVE FORK: passthrough for polyphony-cap enforcement.
+    pub fn collect_groups(&self, out: &mut Vec<(u64, bool)>) {
+        self.voices.collect_groups(out);
+    }
+
+    /// MOVE FORK: drop a whole group; returns voices removed. The next
+    /// `render_to` will reconcile `shared_voice_counter`.
+    pub fn drop_group(&mut self, group_id: u64) -> usize {
+        self.voices.drop_group(group_id)
     }
 }

@@ -166,6 +166,15 @@ impl ChannelGroup {
         self.flush_events();
         buffer.fill(0.0);
 
+        // MOVE FORK: skip channels with no voices and no pending events.
+        // SynthFormat::Midi creates 16 channels; with one active SFZ
+        // instance only channel 0 carries work, but the original code
+        // ran push_key_events_and_render on all 16 every block. Each
+        // empty channel internally fans out 128 nested rayon tasks
+        // (one per key) — 16 × 128 = 2048 idle tasks per block. The
+        // dispatch/join overhead measured at ~800 µs out of an
+        // ~850 µs render. Skipping idle channels collapses that to
+        // ~27 µs (just the one active channel doing real work).
         match self.thread_pool.as_ref() {
             Some(pool) => {
                 let len = buffer.len();
@@ -176,12 +185,18 @@ impl ChannelGroup {
                         .par_iter_mut()
                         .zip(sample_cache_vecs.par_iter_mut())
                         .for_each(|(channel, samples)| {
-                            prepapre_cache_vec(samples, len, 0.0);
-                            channel.read_samples(samples.as_mut_slice());
+                            if channel.has_work() {
+                                prepapre_cache_vec(samples, len, 0.0);
+                                channel.read_samples(samples.as_mut_slice());
+                            } else {
+                                samples.clear();
+                            }
                         });
 
                     for vec in sample_cache_vecs.iter_mut() {
-                        sum_simd(vec, buffer);
+                        if !vec.is_empty() {
+                            sum_simd(vec, buffer);
+                        }
                     }
                 });
             }
@@ -193,12 +208,18 @@ impl ChannelGroup {
                     .iter_mut()
                     .zip(self.sample_cache_vecs.iter_mut())
                 {
-                    prepapre_cache_vec(samples, len, 0.0);
-                    channel.read_samples(samples.as_mut_slice());
+                    if channel.has_work() {
+                        prepapre_cache_vec(samples, len, 0.0);
+                        channel.read_samples(samples.as_mut_slice());
+                    } else {
+                        samples.clear();
+                    }
                 }
 
                 for vec in self.sample_cache_vecs.iter_mut() {
-                    sum_simd(vec, buffer);
+                    if !vec.is_empty() {
+                        sum_simd(vec, buffer);
+                    }
                 }
             }
         }

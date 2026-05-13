@@ -4,10 +4,15 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     ops::{Deref, DerefMut},
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
 };
 
 struct GroupVoice {
-    pub id: usize,
+    /// MOVE FORK: group id is globally unique across all keys in a
+    /// channel (allocated from a shared atomic counter). Lower id =
+    /// older note-on. Used by the polyphony-cap enforcer to pick the
+    /// oldest releasing group across the channel.
+    pub id: u64,
     pub voice: Box<dyn Voice>,
 }
 
@@ -39,38 +44,40 @@ impl Debug for GroupVoice {
 
 pub struct VoiceBuffer {
     options: ChannelInitOptions,
-    id_counter: usize,
+    /// MOVE FORK: channel-shared id allocator. All VoiceBuffers in the
+    /// same VoiceChannel share this Arc so group ids are globally
+    /// orderable. Lower = older.
+    id_counter: Arc<AtomicU64>,
     buffer: VecDeque<GroupVoice>,
     damper_held: bool,
-    held_by_damper: Vec<usize>,
+    held_by_damper: Vec<u64>,
 }
 
 impl VoiceBuffer {
-    pub fn new(options: ChannelInitOptions) -> Self {
+    pub fn new(options: ChannelInitOptions, id_counter: Arc<AtomicU64>) -> Self {
         VoiceBuffer {
             options,
-            id_counter: 0,
+            id_counter,
             buffer: VecDeque::new(),
             damper_held: false,
             held_by_damper: Vec::new(),
         }
     }
 
-    fn get_id(&mut self) -> usize {
-        self.id_counter += 1;
-        self.id_counter
+    fn get_id(&mut self) -> u64 {
+        self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Pops the quietest voice group. Multiple voices can be part of the same group
     /// based on their ID (e.g. a note and a hammer playing at the same time for a note on event)
-    fn pop_quietest_voice_group(&mut self, ignored_id: usize) {
+    fn pop_quietest_voice_group(&mut self, ignored_id: u64) {
         if self.buffer.is_empty() {
             return;
         }
 
         let mut quietest = u8::MAX;
         let mut quietest_index = 0;
-        let mut quietest_id = 0;
+        let mut quietest_id = 0u64;
         let mut count = 0;
         for i in 0..self.buffer.len() {
             let voice = &self.buffer[i];
@@ -114,7 +121,6 @@ impl VoiceBuffer {
             for i in 0..self.buffer.len() {
                 self.kill_voice_fade_out(i);
             }
-            self.id_counter = 0;
         } else {
             self.buffer.clear();
         }
@@ -171,7 +177,7 @@ impl VoiceBuffer {
     /// Releases the next voice, and all subsequent voices that have the same ID.
     pub fn release_next_voice(&mut self) -> Option<u8> {
         if !self.damper_held {
-            let mut id: Option<usize> = None;
+            let mut id: Option<u64> = None;
             let mut vel = None;
 
             // Find the first non releasing voice, get its id and release all voices with that id
@@ -223,10 +229,6 @@ impl VoiceBuffer {
         }
     }
 
-    // pub fn iter_voices<'a>(&'a self) -> impl Iterator<Item = &Box<dyn Voice>> + 'a {
-    //     self.buffer.iter().map(|group| &group.voice)
-    // }
-
     pub fn iter_voices_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn Voice>> {
         self.buffer.iter_mut().map(|group| &mut group.voice)
     }
@@ -250,5 +252,50 @@ impl VoiceBuffer {
             self.held_by_damper.clear();
         }
         self.damper_held = damper;
+    }
+
+    /// MOVE FORK: summarize the groups in this buffer for the polyphony-
+    /// cap enforcer. Appends `(group_id, all_releasing)` per distinct id.
+    /// `all_releasing` is true iff every voice in the group is either
+    /// already releasing or already killed — those groups are the cheapest
+    /// to drop (they were fading to silence anyway).
+    pub fn collect_groups(&self, out: &mut Vec<(u64, bool)>) {
+        let mut current: Option<(u64, bool)> = None;
+        for v in &self.buffer {
+            let releasing = v.is_releasing() || v.is_killed();
+            match current {
+                Some((cur_id, cur_rel)) if cur_id == v.id => {
+                    current = Some((cur_id, cur_rel && releasing));
+                }
+                _ => {
+                    if let Some(prev) = current {
+                        out.push(prev);
+                    }
+                    current = Some((v.id, releasing));
+                }
+            }
+        }
+        if let Some(prev) = current {
+            out.push(prev);
+        }
+    }
+
+    /// MOVE FORK: drop a group via fast envelope-controlled fade-kill.
+    /// Tried instant-remove for hard cap, but the click on pedal-held
+    /// (full-amplitude) voices was too audible. Fade-kill is smoother;
+    /// the tradeoff is that voices keep rendering for ~1 ms after the
+    /// drop, so polyphony temporarily exceeds the cap by drops_needed
+    /// voices during burst blocks. That's bounded by the burst limit
+    /// (default 3 NoteOn/block).
+    pub fn drop_group(&mut self, group_id: u64) -> usize {
+        let mut count = 0;
+        for v in self.buffer.iter_mut() {
+            if v.id == group_id && !v.is_killed() {
+                v.signal_release(ReleaseType::Kill);
+                count += 1;
+            }
+        }
+        self.held_by_damper.retain(|&id| id != group_id);
+        count
     }
 }

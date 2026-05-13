@@ -30,6 +30,24 @@ pub enum ChannelConfigEvent {
     /// Sets the layer count for the soundfont
     SetLayerCount(Option<usize>),
 
+    /// MOVE FORK: polyphony (note-group) cap for the channel. When the
+    /// number of active note groups exceeds this at the start of a render
+    /// block, the oldest releasing group is dropped whole (all voices that
+    /// share its group id, even across keys). Falls back to dropping the
+    /// oldest non-releasing group as a last resort. `None` disables the
+    /// cap. A "group" is one note-on's worth of voices (e.g. WörliTzer's 5
+    /// layers per key = one group of 5 voices).
+    SetPolyphonyCap(Option<usize>),
+
+    /// MOVE FORK: max NoteOn events processed per render block. Spawning
+    /// a voice is ~12 µs (alloc + filter/envelope init + first sample
+    /// reads); a quantized 10-note chord landing in one block adds 50
+    /// voices and ~600 µs of spawn work on top of render. With this set,
+    /// surplus NoteOn events stay in the per-key event cache and fire on
+    /// subsequent blocks (one block ≈ 2.9 ms at 44.1 kHz / 128 frames —
+    /// well below human latency perception). `None` disables the limit.
+    SetSpawnBurstLimit(Option<usize>),
+
     /// Controls whether the channel will be standard or percussion.
     /// Setting to `true` will make the channel only use percussion patches.
     SetPercussionMode(bool),

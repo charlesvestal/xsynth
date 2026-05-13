@@ -1,4 +1,14 @@
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc};
+use std::time::Instant;
+
+// MOVE FORK: per-block render breakdown — diagnostic only. Statics race
+// across channels but for one active SFZ instance the values are usable.
+// Read via `take_render_breakdown_us` and logged from the plugin's
+// render path to localize where overhead hides at low voice counts.
+pub static LAST_PARALLEL_US:   AtomicU32 = AtomicU32::new(0);
+pub static LAST_SUM_US:        AtomicU32 = AtomicU32::new(0);
+pub static LAST_FX_US:         AtomicU32 = AtomicU32::new(0);
+pub static LAST_TOTAL_US:      AtomicU32 = AtomicU32::new(0);
 
 use crate::{
     effects::MultiChannelBiQuad,
@@ -35,10 +45,65 @@ struct Key {
     event_cache: Vec<KeyNoteEvent>,
 }
 
+/// MOVE FORK: drain a key's event cache, honoring a shared spawn budget.
+/// `budget` is None when the channel has no spawn-burst limit (drain
+/// everything). When Some, each NoteOn CAS-decrements the budget; if no
+/// slot is available, the remaining events stay in event_cache (in their
+/// original order) for the next block. Non-NoteOn events are always
+/// drained — they don't spawn voices.
+fn drain_events_with_budget(
+    key: &mut Key,
+    budget: Option<&Arc<std::sync::atomic::AtomicI64>>,
+    control_data: &VoiceControlData,
+    channel_sf: &channel_sf::ChannelSoundfont,
+    layers: Option<usize>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut consumed = 0usize;
+    if let Some(budget) = budget {
+        for e in key.event_cache.iter() {
+            if matches!(e, KeyNoteEvent::On(_)) {
+                let mut got_slot = false;
+                loop {
+                    let prev = budget.load(Ordering::Acquire);
+                    if prev <= 0 {
+                        break;
+                    }
+                    if budget
+                        .compare_exchange(prev, prev - 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        got_slot = true;
+                        break;
+                    }
+                }
+                if !got_slot {
+                    break;
+                }
+            }
+            consumed += 1;
+        }
+    } else {
+        consumed = key.event_cache.len();
+    }
+    if consumed == 0 {
+        return;
+    }
+    let drained: Vec<KeyNoteEvent> = key.event_cache.drain(..consumed).collect();
+    for e in drained {
+        key.data.send_event(e, control_data, channel_sf, layers);
+    }
+}
+
 impl Key {
-    pub fn new(key: u8, shared_voice_counter: Arc<AtomicU64>, options: ChannelInitOptions) -> Self {
+    pub fn new(
+        key: u8,
+        shared_voice_counter: Arc<AtomicU64>,
+        shared_group_id: Arc<AtomicU64>,
+        options: ChannelInitOptions,
+    ) -> Self {
         Key {
-            data: KeyData::new(key, shared_voice_counter, options),
+            data: KeyData::new(key, shared_voice_counter, shared_group_id, options),
             audio_cache: Vec::new(),
             event_cache: Vec::new(),
         }
@@ -130,10 +195,16 @@ impl VoiceChannel {
 
         let params = VoiceChannelParams::new(stream_params);
         let shared_voice_counter = params.stats.voice_counter.clone();
+        // MOVE FORK: shared group-id allocator for polyphony-cap support.
+        // All keys' VoiceBuffers draw from this so group ids are globally
+        // orderable across the channel (lower id = older note-on).
+        let shared_group_id = Arc::new(AtomicU64::new(0));
 
         VoiceChannel {
             params,
-            key_voices: fill_key_array(|i| Key::new(i, shared_voice_counter.clone(), options)),
+            key_voices: fill_key_array(|i| {
+                Key::new(i, shared_voice_counter.clone(), shared_group_id.clone(), options)
+            }),
 
             threadpool,
 
@@ -190,49 +261,139 @@ impl VoiceChannel {
         }
     }
 
+    /// MOVE FORK: drop oldest note-groups so that polyphony stays at cap
+    /// throughout the upcoming block — including after pending NoteOns
+    /// drain. Counts NoteOns waiting in per-key event caches (bounded by
+    /// the spawn-burst limit if set), and pre-drops `current + pending -
+    /// cap` groups before the drain runs. Combined with `drop_group`'s
+    /// instant-remove semantics, this gives a hard ceiling: voice count
+    /// can never exceed `cap × voices_per_note` in any block, even during
+    /// quantized chord bursts on top of pedal-held sustain.
+    ///
+    /// Drop priority: releasing groups first (their tails were fading
+    /// anyway), then oldest groups regardless of state.
+    fn enforce_polyphony_cap(&mut self) {
+        let cap = match self.params.polyphony_cap {
+            Some(c) => c,
+            None => return,
+        };
+        let burst_limit = self.params.spawn_burst_limit.unwrap_or(usize::MAX);
+
+        // Count pending NoteOns that will drain this block. Capped by
+        // spawn-burst so we don't pre-drop for events that won't actually
+        // arrive until next block.
+        let mut pending_noteons = 0usize;
+        for key in self.key_voices.iter() {
+            for e in key.event_cache.iter() {
+                if matches!(e, KeyNoteEvent::On(_)) {
+                    pending_noteons += 1;
+                    if pending_noteons >= burst_limit {
+                        break;
+                    }
+                }
+            }
+            if pending_noteons >= burst_limit {
+                break;
+            }
+        }
+
+        // Collect every group across every key: (key_idx, group_id, all_releasing).
+        let mut groups: Vec<(usize, u64, bool)> = Vec::new();
+        let mut buf: Vec<(u64, bool)> = Vec::new();
+        for (ki, key) in self.key_voices.iter().enumerate() {
+            buf.clear();
+            key.data.collect_groups(&mut buf);
+            for &(gid, rel) in &buf {
+                groups.push((ki, gid, rel));
+            }
+        }
+        let current_polyphony = groups.len();
+        let projected = current_polyphony + pending_noteons;
+        if projected <= cap {
+            return;
+        }
+        let drops_needed = projected - cap;
+
+        // Sort: releasing-first (cheaper to drop, already curving down),
+        // then by group id ascending (oldest first within each category).
+        groups.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+
+        for &(ki, gid, _) in groups.iter().take(drops_needed) {
+            self.key_voices[ki].data.drop_group(gid);
+        }
+    }
+
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
+        let t_total = Instant::now();
         self.params.load_program();
+        self.enforce_polyphony_cap();
+
+        // MOVE FORK: shared spawn-burst budget for this block. When set,
+        // worker threads CAS-decrement before processing each NoteOn;
+        // any worker that can't claim a slot leaves the remaining events
+        // (in their original order) in the key's event_cache for the
+        // next block to pick up first. Drain stays in the parallel
+        // section so the spawn-burst doesn't serialize spawn cost on the
+        // audio thread — that single change alone added ~400 µs to the
+        // burst block render time on Move.
+        let spawn_budget: Option<Arc<std::sync::atomic::AtomicI64>> = self
+            .params
+            .spawn_burst_limit
+            .map(|n| Arc::new(std::sync::atomic::AtomicI64::new(n as i64)));
 
         out.fill(0.0);
+        let t_parallel = Instant::now();
         match self.threadpool.as_ref() {
             Some(pool) => {
                 let len = out.len();
                 let key_voices = &mut self.key_voices;
                 let params = &self.params;
                 let control_data = &self.voice_control_data;
+                let spawn_budget = spawn_budget.as_ref();
                 pool.install(|| {
                     key_voices.par_iter_mut().for_each(move |key| {
-                        for e in key.event_cache.drain(..) {
-                            key.data
-                                .send_event(e, control_data, &params.channel_sf, params.layers);
-                        }
+                        drain_events_with_budget(
+                            key,
+                            spawn_budget,
+                            control_data,
+                            &params.channel_sf,
+                            params.layers,
+                        );
 
                         prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
                         key.data.render_to(&mut key.audio_cache);
                     });
                 });
+                let parallel_us = t_parallel.elapsed().as_micros() as u32;
+                LAST_PARALLEL_US.store(parallel_us, Ordering::Relaxed);
 
+                let t_sum = Instant::now();
                 for key in self.key_voices.iter() {
                     sum_simd(&key.audio_cache, out);
                 }
+                LAST_SUM_US.store(t_sum.elapsed().as_micros() as u32, Ordering::Relaxed);
             }
             None => {
                 for key in self.key_voices.iter_mut() {
-                    for e in key.event_cache.drain(..) {
-                        key.data.send_event(
-                            e,
-                            &self.voice_control_data,
-                            &self.params.channel_sf,
-                            self.params.layers,
-                        );
-                    }
+                    drain_events_with_budget(
+                        key,
+                        spawn_budget.as_ref(),
+                        &self.voice_control_data,
+                        &self.params.channel_sf,
+                        self.params.layers,
+                    );
 
                     key.data.render_to(out);
                 }
+                LAST_PARALLEL_US.store(t_parallel.elapsed().as_micros() as u32, Ordering::Relaxed);
+                LAST_SUM_US.store(0, Ordering::Relaxed);
             }
         }
 
+        let t_fx = Instant::now();
         self.apply_channel_effects(out);
+        LAST_FX_US.store(t_fx.elapsed().as_micros() as u32, Ordering::Relaxed);
+        LAST_TOTAL_US.store(t_total.elapsed().as_micros() as u32, Ordering::Relaxed);
     }
 
     fn propagate_voice_controls(&mut self) {
@@ -318,6 +479,30 @@ impl VoiceChannel {
     pub fn get_channel_stats(&self) -> VoiceChannelStatsReader {
         let stats = self.params.stats.clone();
         VoiceChannelStatsReader::new(stats)
+    }
+
+    /// MOVE FORK: cheap "does this channel have anything to render?" check.
+    /// Used by ChannelGroup::render_to to skip empty channels — at 16 MIDI
+    /// channels and one active SFZ instance, skipping the 15 idle channels
+    /// shaves ~800 µs per render block (buffer fills, 128-key parallel
+    /// iter, apply_channel_effects sweep). Must be called AFTER
+    /// flush_events so events queued at the group level have been pushed
+    /// to per-key caches.
+    pub fn has_work(&self) -> bool {
+        let voice_count = self
+            .params
+            .stats
+            .voice_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if voice_count > 0 {
+            return true;
+        }
+        for key in self.key_voices.iter() {
+            if !key.event_cache.is_empty() {
+                return true;
+            }
+        }
+        false
     }
 
     /// MOVE FORK: register a deferred-drop sink (see channel_sf::SoundfontDropSink).

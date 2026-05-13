@@ -251,7 +251,7 @@ pub(super) fn load_audio_file(
     }
     let heap: Arc<[Arc<SampleStorage>]> = built_i16
         .iter()
-        .map(|chan| Arc::new(SampleStorage::Heap(chan.clone())))
+        .map(|chan| Arc::new(SampleStorage::from_heap(chan.clone())))
         .collect();
     Ok((heap, sample_rate))
 }

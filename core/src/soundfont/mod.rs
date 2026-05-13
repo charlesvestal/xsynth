@@ -527,11 +527,11 @@ impl SampleSoundfont {
                                 Arc::new([region_samples[0].clone(), region_samples[0].clone()]);
                         }
                         // MOVE FORK: SF2 ships Arc<[Arc<[i16]>]>; wrap each
-                        // per-channel buffer in SampleStorage::Heap so it
-                        // matches the unified SampleVoiceSpawnerParams type.
+                        // per-channel buffer in SampleStorage so it matches
+                        // the unified SampleVoiceSpawnerParams type.
                         let sample_storage: Arc<[Arc<SampleStorage>]> = region_samples
                             .iter()
-                            .map(|c| Arc::new(SampleStorage::Heap(c.clone())))
+                            .map(|c| Arc::new(SampleStorage::from_heap(c.clone())))
                             .collect();
 
                         let spawner_params = Arc::new(SampleVoiceSpawnerParams {

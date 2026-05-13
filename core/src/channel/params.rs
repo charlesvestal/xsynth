@@ -26,6 +26,11 @@ pub struct VoiceChannelConst {
 pub struct VoiceChannelParams {
     pub stats: VoiceChannelStats,
     pub layers: Option<usize>,
+    /// MOVE FORK: polyphony (note-group) cap. See `ChannelConfigEvent::SetPolyphonyCap`.
+    pub polyphony_cap: Option<usize>,
+    /// MOVE FORK: max NoteOn events drained per render block. Defers
+    /// surplus events to subsequent blocks. See `SetSpawnBurstLimit`.
+    pub spawn_burst_limit: Option<usize>,
     pub channel_sf: ChannelSoundfont,
     pub program: ProgramDescriptor,
     pub constant: VoiceChannelConst,
@@ -51,6 +56,8 @@ impl VoiceChannelParams {
         Self {
             stats: VoiceChannelStats::new(),
             layers: Some(4),
+            polyphony_cap: None,
+            spawn_burst_limit: None,
             channel_sf,
             program: Default::default(),
             constant: VoiceChannelConst { stream_params },
@@ -64,6 +71,12 @@ impl VoiceChannelParams {
             }
             ChannelConfigEvent::SetLayerCount(count) => {
                 self.layers = count;
+            }
+            ChannelConfigEvent::SetPolyphonyCap(cap) => {
+                self.polyphony_cap = cap;
+            }
+            ChannelConfigEvent::SetSpawnBurstLimit(limit) => {
+                self.spawn_burst_limit = limit;
             }
             ChannelConfigEvent::SetPercussionMode(set) => {
                 if set {
