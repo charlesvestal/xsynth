@@ -48,7 +48,7 @@ pub static RENDER_BLOCK_COUNTER: AtomicU32 = AtomicU32::new(0);
 use crate::{
     effects::MultiChannelBiQuad,
     helpers::{prepapre_cache_vec, sum_simd},
-    voice::VoiceControlData,
+    voice::{new_cc_state, CcState, VoiceControlData},
     AudioStreamParams, ChannelCount,
 };
 
@@ -203,6 +203,14 @@ pub struct VoiceChannel {
     /// Processed control data, ready to feed to voices
     voice_control_data: VoiceControlData,
 
+    /// MOVE FORK: per-channel raw MIDI CC array. Every `ControlEvent::Raw`
+    /// stores its value here (in addition to whatever specialized
+    /// handler runs). Voices will clone the Arc at spawn time to read
+    /// live `_oncc` modulation under Ordering::Relaxed. Unused by voice
+    /// generators today — Step 5 (SIMDVoiceOnccAmp) will consume it.
+    /// ResetControl wipes back to zeros.
+    cc_state: CcState,
+
     /// Effects
     cutoff: MultiChannelBiQuad,
 }
@@ -247,6 +255,7 @@ impl VoiceChannel {
 
             control_event_data: ControlEventData::new_defaults(stream_params.sample_rate),
             voice_control_data: VoiceControlData::new_defaults(),
+            cc_state: new_cc_state(),
 
             cutoff: MultiChannelBiQuad::new(
                 stream_params.channels.count() as usize,

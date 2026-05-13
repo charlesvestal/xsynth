@@ -33,6 +33,19 @@ pub(crate) use control::*;
 mod cutoff;
 pub(crate) use cutoff::*;
 
+/// MOVE FORK: per-channel raw MIDI CC array. Updated by the channel
+/// every `ControlEvent::Raw(cc, val)`. Voices clone the `Arc` at spawn
+/// time and live `_oncc` generators (e.g. SIMDVoiceOnccAmp in a later
+/// phase) read it under `Ordering::Relaxed`. ResetControl wipes back
+/// to zeros. The array is fixed-size 128 — one byte per MIDI CC
+/// number — so an Arc clone is just a refcount increment.
+pub type CcState = std::sync::Arc<[std::sync::atomic::AtomicU8; 128]>;
+
+/// MOVE FORK: build a fresh CcState with every CC at 0.
+pub fn new_cc_state() -> CcState {
+    std::sync::Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(0)))
+}
+
 /// Options to modify the envelope of a voice.
 #[derive(Copy, Clone)]
 pub struct EnvelopeControlData {

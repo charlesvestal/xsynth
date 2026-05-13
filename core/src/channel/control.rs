@@ -83,6 +83,18 @@ impl VoiceChannel {
     /// Sends a ControlEvent to the channel.
     /// See the `ControlEvent` documentation for more information.
     pub fn process_control_event(&mut self, event: ControlEvent) {
+        // MOVE FORK: capture every raw CC value into the per-channel
+        // atomic array so live `_oncc` voice generators (Step 5+) can
+        // sample under Ordering::Relaxed. The existing specialized
+        // arms (CC7 volume, CC10 pan, ...) still run below. Just one
+        // atomic store per event — negligible cost; we do NOT fan out
+        // a propagate_voice_controls here (that path pinned the audio
+        // thread at 100% during knob sweeps in the earlier Phase 3
+        // attempt). Voice generators poll the atomic on a counter.
+        if let ControlEvent::Raw(cc, val) = event {
+            self.cc_state[cc as usize].store(val, std::sync::atomic::Ordering::Relaxed);
+        }
+
         match event {
             ControlEvent::Raw(controller, value) => match controller {
                 0x00 => {
@@ -270,6 +282,11 @@ impl VoiceChannel {
     pub(super) fn reset_control(&mut self) {
         self.control_event_data = ControlEventData::new_defaults(self.stream_params.sample_rate);
         self.voice_control_data = VoiceControlData::new_defaults();
+        // MOVE FORK: clear the raw CC array too so live `_oncc` voice
+        // generators see the reset state on their next sample.
+        for slot in self.cc_state.iter() {
+            slot.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         self.propagate_voice_controls();
 
         self.control_event_data.cutoff = None;
