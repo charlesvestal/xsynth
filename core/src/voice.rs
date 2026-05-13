@@ -93,4 +93,14 @@ pub trait Voice: VoiceSampleGenerator + Send + Sync {
 
     fn velocity(&self) -> u8;
     fn exclusive_class(&self) -> Option<u8>;
+
+    /// MOVE FORK: set `is_releasing=true` on this voice WITHOUT
+    /// triggering envelope release. Used for `trigger=release` voices
+    /// at spawn time: they shouldn't be candidates for future NoteOff
+    /// release (release_next_voice skips releasing voices), but their
+    /// internal envelope must play its attack/sustain/release phases
+    /// normally so the release-trigger sample plays its full authored
+    /// duration. Default no-op so non-Voice implementors don't have to
+    /// care.
+    fn mark_as_release_trigger(&mut self) {}
 }

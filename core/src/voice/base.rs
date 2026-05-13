@@ -80,4 +80,13 @@ where
     fn exclusive_class(&self) -> Option<u8> {
         self.exclusive_class
     }
+
+    #[inline(always)]
+    fn mark_as_release_trigger(&mut self) {
+        // Set only the outer `releasing` flag — do NOT propagate to
+        // the sample generator's envelope. The envelope must play its
+        // normal attack→decay→sustain→release course so the
+        // release-trigger sample plays in full.
+        self.releasing = true;
+    }
 }

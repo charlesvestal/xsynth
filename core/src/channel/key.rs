@@ -8,6 +8,23 @@ use super::{
     ChannelInitOptions, VoiceControlData,
 };
 
+/// MOVE FORK: append one diagnostic line to xsynth_debug.log per
+/// NoteOn/NoteOff/AllOff. Notes are sparse (<100/sec on heavy play)
+/// so file I/O on the audio thread is tolerable here. Used to hunt
+/// the "random infinite release" bug — pairs of On/Off lines plus
+/// state counts let us see when a NoteOff fails to release the just-
+/// played group.
+fn log_event(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+    {
+        let _ = writeln!(f, "{}", args);
+    }
+}
+
 pub struct KeyData {
     key: u8,
     voices: VoiceBuffer,
@@ -39,20 +56,61 @@ impl KeyData {
     ) {
         match event {
             KeyNoteEvent::On(vel) => {
+                let before = self.voices.voice_count();
                 let voices = channel_sf.spawn_voices_attack(control, self.key, vel);
                 self.voices.push_voices(voices, max_layers);
+                let (total, releasing, killed) = self.voices.voice_state_counts();
+                log_event(format_args!(
+                    "[ev] On  key={:>3} vel={:>3} spawned={} total={} releasing={} killed={}",
+                    self.key, vel, total - before, total, releasing, killed,
+                ));
             }
             KeyNoteEvent::Off => {
+                let before_total = self.voices.voice_count();
                 let vel = self.voices.release_next_voice();
+                let mut spawned_rt = 0usize;
                 if let Some(vel) = vel {
+                    let before_rt = self.voices.voice_count();
                     let voices = channel_sf.spawn_voices_release(control, self.key, vel);
-                    self.voices.push_voices(voices, max_layers);
+                    // MOVE FORK: push release-trigger voices with the
+                    // is_releasing flag pre-set, so a SUBSEQUENT NoteOff
+                    // on this key skips them and properly releases the
+                    // next attack voice group instead. Without this,
+                    // we observed key=40 random infinite-release after
+                    // a rapid On/Off cycle that left an RT voice at
+                    // front of the buffer.
+                    self.voices.push_release_trigger_voices(voices, max_layers);
+                    spawned_rt = self.voices.voice_count() - before_rt;
                 }
+                let (total, releasing, killed) = self.voices.voice_state_counts();
+                log_event(format_args!(
+                    "[ev] Off key={:>3} released_vel={:?} rt_spawned={} before_total={} total={} releasing={} killed={}",
+                    self.key, vel, spawned_rt, before_total, total, releasing, killed,
+                ));
             }
             KeyNoteEvent::AllOff => {
-                while let Some(vel) = self.voices.release_next_voice() {
+                // MOVE FORK: snapshot non-releasing groups in one pass
+                // and spawn release-trigger voices for each. The
+                // previous `while let Some(vel) = release_next_voice()`
+                // pattern infinite-looped on presets with release-
+                // trigger regions (e.g. WörliTzer): each spawned
+                // release-trigger voice is itself non-releasing, so
+                // the next loop iteration would release it and spawn
+                // MORE release-trigger voices, forever.
+                let release_vels = self.voices.release_all_groups_snapshot();
+                let n = release_vels.len();
+                for vel in release_vels {
                     let voices = channel_sf.spawn_voices_release(control, self.key, vel);
-                    self.voices.push_voices(voices, max_layers);
+                    // MOVE FORK: same reason as the NoteOff path — RT
+                    // voices must be pre-flagged as releasing.
+                    self.voices.push_release_trigger_voices(voices, max_layers);
+                }
+                if n > 0 {
+                    let (total, releasing, killed) = self.voices.voice_state_counts();
+                    log_event(format_args!(
+                        "[ev] AllOff key={:>3} groups_released={} total={} releasing={} killed={}",
+                        self.key, n, total, releasing, killed,
+                    ));
                 }
             }
             KeyNoteEvent::AllKilled => {

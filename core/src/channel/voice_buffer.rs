@@ -144,6 +144,51 @@ impl VoiceBuffer {
         active
     }
 
+    /// MOVE FORK: like `push_voices`, but marks every voice as
+    /// "release-trigger" so it's invisible to `release_next_voice`
+    /// and `release_all_groups_snapshot`. Use for the voices spawned
+    /// by `spawn_voices_release` (i.e. `trigger=release` samples).
+    ///
+    /// Without this, a NoteOff that spawned a release-trigger voice
+    /// would itself become a candidate for the next NoteOff's release:
+    /// release_next_voice would find the RT voice at the front of the
+    /// buffer (non-releasing, non-killed) and "release" it, taking
+    /// the slot from the actually-just-played voice — which would
+    /// then play its sample to the end, audibly ignoring the user's
+    /// key-up. (Diagnosed on WörliTzer key 40: rapid Off/On/Off
+    /// sequence repeatedly mis-released the RT voice instead of the
+    /// new attack voices.)
+    pub fn push_release_trigger_voices(
+        &mut self,
+        voices: impl Iterator<Item = Box<dyn Voice>>,
+        max_voices: Option<usize>,
+    ) {
+        let mut len = 0;
+        let id = self.get_id();
+        for mut voice in voices {
+            voice.mark_as_release_trigger();
+            self.buffer.push_back(GroupVoice { id, voice });
+            len += 1;
+        }
+
+        // Same polyphony-cap path as push_voices — release-trigger
+        // voices still count against per-key layer cap (relevant when
+        // a layered preset has many release-trigger regions).
+        if let Some(max_voices) = max_voices {
+            if len > max_voices {
+                self.pop_quietest_voice_group(id);
+            } else if self.options.fade_out_killing {
+                while self.get_active_count() > max_voices {
+                    self.pop_quietest_voice_group(id);
+                }
+            } else {
+                while self.buffer.len() > max_voices {
+                    self.pop_quietest_voice_group(id);
+                }
+            }
+        }
+    }
+
     /// Pushes a new set of voices for a single note on event. Multiple voices can be part of the same group
     /// based on their ID (e.g. a note and a hammer playing at the same time for a note on event)
     pub fn push_voices(
@@ -174,15 +219,73 @@ impl VoiceBuffer {
         }
     }
 
+    /// MOVE FORK: snapshot every currently-non-releasing voice group,
+    /// mark them all as releasing in one pass, return their velocities
+    /// for the caller to spawn `trigger=release` samples per group.
+    ///
+    /// Avoids the infinite-loop pattern in the caller:
+    ///     while let Some(vel) = self.release_next_voice() {
+    ///         let voices = channel_sf.spawn_voices_release(...);
+    ///         self.push_voices(voices, ...);
+    ///     }
+    /// Those newly-pushed release-trigger voices are themselves
+    /// non-releasing, so the loop's next `release_next_voice` finds and
+    /// releases them, which spawns MORE release-trigger voices, ad
+    /// infinitum on presets like WörliTzer that have release-trigger
+    /// groups. The snapshot only iterates the groups that existed at
+    /// entry; voices spawned by spawn_voices_release are left to play
+    /// their tails without being re-released.
+    ///
+    /// damper_held: skipped (matches release_next_voice's else branch —
+    /// release deferred until damper lifts).
+    pub fn release_all_groups_snapshot(&mut self) -> Vec<u8> {
+        if self.damper_held {
+            // Mirror the per-call damper-held path: add each non-releasing,
+            // not-already-tracked group's id to held_by_damper, no vels.
+            // is_killed voices are skipped — they're already going away.
+            for voice in self.buffer.iter_mut() {
+                if voice.is_releasing() || voice.is_killed() {
+                    continue;
+                }
+                if self.held_by_damper.contains(&voice.id) {
+                    continue;
+                }
+                self.held_by_damper.push(voice.id);
+            }
+            return Vec::new();
+        }
+        let mut velocities = Vec::new();
+        let mut last_id: Option<u64> = None;
+        for voice in self.buffer.iter_mut() {
+            if voice.is_releasing() || voice.is_killed() {
+                continue;
+            }
+            if last_id != Some(voice.id) {
+                velocities.push(voice.velocity());
+                last_id = Some(voice.id);
+            }
+            voice.signal_release(ReleaseType::Standard);
+        }
+        velocities
+    }
+
     /// Releases the next voice, and all subsequent voices that have the same ID.
     pub fn release_next_voice(&mut self) -> Option<u8> {
         if !self.damper_held {
             let mut id: Option<u64> = None;
             let mut vel = None;
 
-            // Find the first non releasing voice, get its id and release all voices with that id
+            // Find the first non releasing voice, get its id and release all voices with that id.
+            // MOVE FORK: ALSO skip is_killed() voices — drop_group (polyphony-cap
+            // enforce) sets killed=true but leaves releasing=false. Without
+            // this skip, a NoteOff on key K would "release" an old killed
+            // group at the front of the buffer (a no-op since the voice is
+            // already fading out via Kill) and the ACTUAL just-played voice
+            // at K would never receive its release. Symptom: random notes
+            // play their sample fully, ignoring key-up. Same fix applies to
+            // release_all_groups_snapshot above.
             for voice in self.buffer.iter_mut() {
-                if voice.is_releasing() {
+                if voice.is_releasing() || voice.is_killed() {
                     continue;
                 }
 
@@ -239,6 +342,19 @@ impl VoiceBuffer {
 
     pub fn voice_count(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// MOVE FORK: per-state voice counts for diagnostics. Returns
+    /// `(total, releasing, killed)` — voices may be in both states
+    /// (signal_release after Kill). Killed implies count overlap.
+    pub fn voice_state_counts(&self) -> (usize, usize, usize) {
+        let mut releasing = 0;
+        let mut killed = 0;
+        for v in self.buffer.iter() {
+            if v.is_releasing() { releasing += 1; }
+            if v.is_killed() { killed += 1; }
+        }
+        (self.buffer.len(), releasing, killed)
     }
 
     pub fn set_damper(&mut self, damper: bool) {
