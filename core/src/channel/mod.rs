@@ -10,6 +10,41 @@ pub static LAST_SUM_US:        AtomicU32 = AtomicU32::new(0);
 pub static LAST_FX_US:         AtomicU32 = AtomicU32::new(0);
 pub static LAST_TOTAL_US:      AtomicU32 = AtomicU32::new(0);
 
+// MOVE FORK: render-phase trace for the audio-thread-freeze hunt.
+// `RENDER_PHASE` is updated as the audio thread crosses each major
+// stage inside `push_key_events_and_render`. A separate heartbeat
+// thread in the shim polls this every 50 ms and writes the current
+// value to xsynth_debug.log — so if the audio thread freezes, the
+// last-seen phase persists and the heartbeat keeps echoing it.
+//
+// Major values:
+//   0 = idle / outside render
+//   1 = entered push_key_events_and_render
+//   2 = enforce_polyphony_cap done
+//   3 = parallel/serial per-key drain+render entered
+//   4 = inside drain_events_with_budget (spawning voices)
+//   5 = inside per-key render_to (voice generators producing samples)
+//   6 = sum_simd done (mix per-key buffers)
+//   7 = apply_channel_effects entered
+//   8 = render done, about to return
+//
+// Sub-phases inside the spawn path (drilled down from 4):
+//  40 = drain entered (event_cache walk)
+//  41 = about to send_event for one event
+//  42 = inside send_event NoteOn, calling spawn_voices_attack
+//  43 = push_voices: iterator-consumption for-loop
+//  44 = push_voices: post-cap branch entered (len > max OR while loop)
+//  45 = push_voices: pop_quietest_voice_group call
+//  46 = send_event NoteOff: release_next_voice
+//  47 = send_event NoteOff: push_voices for release-trigger samples
+pub static RENDER_PHASE: AtomicU32 = AtomicU32::new(0);
+// Key index currently being processed in phases 4/5. 255 means
+// "between keys" (or the value's from a previous block).
+pub static RENDER_KEY: AtomicU32 = AtomicU32::new(255);
+// Strictly monotonic counter, incremented each block. The heartbeat
+// reads this and the last-seen value to detect a stuck block.
+pub static RENDER_BLOCK_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 use crate::{
     effects::MultiChannelBiQuad,
     helpers::{prepapre_cache_vec, sum_simd},
@@ -324,9 +359,15 @@ impl VoiceChannel {
     }
 
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
+        // MOVE FORK: phase trace — see RENDER_PHASE static for value map.
+        RENDER_BLOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        RENDER_PHASE.store(1, Ordering::Relaxed);
+        RENDER_KEY.store(255, Ordering::Relaxed);
+
         let t_total = Instant::now();
         self.params.load_program();
         self.enforce_polyphony_cap();
+        RENDER_PHASE.store(2, Ordering::Relaxed);
 
         // MOVE FORK: shared spawn-burst budget for this block. When set,
         // worker threads CAS-decrement before processing each NoteOn;
@@ -343,6 +384,7 @@ impl VoiceChannel {
 
         out.fill(0.0);
         let t_parallel = Instant::now();
+        RENDER_PHASE.store(3, Ordering::Relaxed);
         match self.threadpool.as_ref() {
             Some(pool) => {
                 let len = out.len();
@@ -371,10 +413,16 @@ impl VoiceChannel {
                 for key in self.key_voices.iter() {
                     sum_simd(&key.audio_cache, out);
                 }
+                RENDER_PHASE.store(6, Ordering::Relaxed);
                 LAST_SUM_US.store(t_sum.elapsed().as_micros() as u32, Ordering::Relaxed);
             }
             None => {
-                for key in self.key_voices.iter_mut() {
+                // MOVE FORK: serial-per-key path (AUTO_PER_CHANNEL config).
+                // Phase trace surfaces which key is being drained/rendered
+                // so a freeze localizes to the responsible voice.
+                for (ki, key) in self.key_voices.iter_mut().enumerate() {
+                    RENDER_KEY.store(ki as u32, Ordering::Relaxed);
+                    RENDER_PHASE.store(4, Ordering::Relaxed);
                     drain_events_with_budget(
                         key,
                         spawn_budget.as_ref(),
@@ -383,17 +431,22 @@ impl VoiceChannel {
                         self.params.layers,
                     );
 
+                    RENDER_PHASE.store(5, Ordering::Relaxed);
                     key.data.render_to(out);
                 }
+                RENDER_KEY.store(255, Ordering::Relaxed);
+                RENDER_PHASE.store(6, Ordering::Relaxed);
                 LAST_PARALLEL_US.store(t_parallel.elapsed().as_micros() as u32, Ordering::Relaxed);
                 LAST_SUM_US.store(0, Ordering::Relaxed);
             }
         }
 
+        RENDER_PHASE.store(7, Ordering::Relaxed);
         let t_fx = Instant::now();
         self.apply_channel_effects(out);
         LAST_FX_US.store(t_fx.elapsed().as_micros() as u32, Ordering::Relaxed);
         LAST_TOTAL_US.store(t_total.elapsed().as_micros() as u32, Ordering::Relaxed);
+        RENDER_PHASE.store(8, Ordering::Relaxed);
     }
 
     fn propagate_voice_controls(&mut self) {
