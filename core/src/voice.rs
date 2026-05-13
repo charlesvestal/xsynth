@@ -33,6 +33,9 @@ pub(crate) use control::*;
 mod cutoff;
 pub(crate) use cutoff::*;
 
+mod oncc_amp;
+pub(crate) use oncc_amp::*;
+
 /// MOVE FORK: per-channel raw MIDI CC array. Updated by the channel
 /// every `ControlEvent::Raw(cc, val)`. Voices clone the `Arc` at spawn
 /// time and live `_oncc` generators (e.g. SIMDVoiceOnccAmp in a later

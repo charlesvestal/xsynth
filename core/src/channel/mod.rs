@@ -90,6 +90,7 @@ fn drain_events_with_budget(
     key: &mut Key,
     budget: Option<&Arc<std::sync::atomic::AtomicI64>>,
     control_data: &VoiceControlData,
+    cc_state: &CcState,
     channel_sf: &channel_sf::ChannelSoundfont,
     layers: Option<usize>,
 ) {
@@ -126,7 +127,7 @@ fn drain_events_with_budget(
     }
     let drained: Vec<KeyNoteEvent> = key.event_cache.drain(..consumed).collect();
     for e in drained {
-        key.data.send_event(e, control_data, channel_sf, layers);
+        key.data.send_event(e, control_data, cc_state, channel_sf, layers);
     }
 }
 
@@ -400,6 +401,7 @@ impl VoiceChannel {
                 let key_voices = &mut self.key_voices;
                 let params = &self.params;
                 let control_data = &self.voice_control_data;
+                let cc_state = &self.cc_state;
                 let spawn_budget = spawn_budget.as_ref();
                 pool.install(|| {
                     key_voices.par_iter_mut().for_each(move |key| {
@@ -407,6 +409,7 @@ impl VoiceChannel {
                             key,
                             spawn_budget,
                             control_data,
+                            cc_state,
                             &params.channel_sf,
                             params.layers,
                         );
@@ -436,6 +439,7 @@ impl VoiceChannel {
                         key,
                         spawn_budget.as_ref(),
                         &self.voice_control_data,
+                        &self.cc_state,
                         &self.params.channel_sf,
                         self.params.layers,
                     );

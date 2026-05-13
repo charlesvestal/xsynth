@@ -3,7 +3,7 @@ use std::{iter, ops::Deref, sync::{Arc, Mutex}};
 use crate::{
     helpers::are_arc_vecs_equal,
     soundfont::SoundfontBase,
-    voice::{Voice, VoiceControlData},
+    voice::{CcState, Voice, VoiceControlData},
 };
 
 use super::voice_spawner::VoiceSpawnerMatrix;
@@ -175,19 +175,21 @@ impl ChannelSoundfont {
     pub fn spawn_voices_attack<'a>(
         &'a self,
         control: &'a VoiceControlData,
+        cc_state: &'a CcState,
         key: u8,
         vel: u8,
     ) -> impl Iterator<Item = Box<dyn Voice>> + 'a {
-        self.matrix.spawn_voices_attack(control, key, vel)
+        self.matrix.spawn_voices_attack(control, cc_state, key, vel)
     }
 
     pub fn spawn_voices_release<'a>(
         &'a self,
         control: &'a VoiceControlData,
+        cc_state: &'a CcState,
         key: u8,
         vel: u8,
     ) -> impl Iterator<Item = Box<dyn Voice>> + 'a {
-        self.matrix.spawn_voices_release(control, key, vel)
+        self.matrix.spawn_voices_release(control, cc_state, key, vel)
     }
 
     pub fn exclusive_classes_attack<'a>(

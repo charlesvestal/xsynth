@@ -22,7 +22,7 @@ use super::{
     voice::VoiceControlData,
     voice::{EnvelopeParameters, Voice},
 };
-use crate::{helpers::db_to_amp, voice::EnvelopeDescriptor, AudioStreamParams, ChannelCount};
+use crate::{helpers::db_to_amp, voice::{CcState, EnvelopeDescriptor}, AudioStreamParams, ChannelCount};
 
 pub use xsynth_soundfonts::{sf2::Sf2ParseError, sfz::SfzParseError};
 
@@ -38,7 +38,13 @@ pub use sample_storage::{MmapHolder, SampleStorage};
 pub use config::*;
 
 pub trait VoiceSpawner: Sync + Send {
-    fn spawn_voice(&self, control: &VoiceControlData) -> Box<dyn Voice>;
+    /// Spawn a voice for this region.
+    ///
+    /// MOVE FORK: `cc_state` is the per-channel raw CC atomic array.
+    /// Live `_oncc` voice generators (SIMDVoiceOnccAmp) clone the Arc
+    /// to sample CC values per render block. Spawners with no live-CC
+    /// bindings ignore it (one Arc::clone refcount increment).
+    fn spawn_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice>;
     fn exclusive_class(&self) -> Option<u8> {
         None
     }
@@ -88,6 +94,12 @@ struct SampleVoiceSpawnerParams {
     /// 0 means "always fire" (no RR). When >0, this spawner only fires
     /// on the NoteOn whose `RrState::counter` lands on this position.
     seq_position: u8,
+    /// MOVE FORK: live `volume_oncc<N>=<dB>` bindings from the region.
+    /// One Arc shared across all (key, vel) spawners derived from the
+    /// same region. Voice gets a cheap Arc::clone at spawn time.
+    /// Empty when the region has no volume_oncc opcodes (most SFZ
+    /// files; non-DS-converted patches).
+    volume_oncc: Arc<[(u8, f32)]>,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -339,6 +351,10 @@ impl SampleSoundfont {
                 continue;
             }
 
+            // MOVE FORK: one Arc per region for live `volume_oncc` bindings,
+            // cloned cheaply into every (key, vel) spawner.
+            let volume_oncc: Arc<[(u8, f32)]> = region.volume_oncc.clone().into();
+
             for key in region.keyrange.clone() {
                 for vel in region.velrange.clone() {
                     let index = key_vel_to_index(key as u8, vel);
@@ -437,6 +453,7 @@ impl SampleSoundfont {
                         sample: region_samples,
                         exclusive_class: None,
                         seq_position: region.seq_position.min(u8::MAX as u32) as u8,
+                        volume_oncc: volume_oncc.clone(),
                     });
 
                     // MOVE FORK: track max seq_length seen at this slot
@@ -613,6 +630,8 @@ impl SampleSoundfont {
                             sample: sample_storage,
                             exclusive_class: region.exclusive_class,
                             seq_position: 0, // SF2 has no round-robin concept
+                            // SF2 has no `_oncc` surface; empty Arc.
+                            volume_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());

@@ -7,6 +7,7 @@ use super::{
     channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::VoiceBuffer,
     ChannelInitOptions, VoiceControlData,
 };
+use crate::voice::CcState;
 
 /// MOVE FORK: append one diagnostic line to xsynth_debug.log per
 /// NoteOn/NoteOff/AllOff. Notes are sparse (<100/sec on heavy play)
@@ -51,13 +52,14 @@ impl KeyData {
         &mut self,
         event: KeyNoteEvent,
         control: &VoiceControlData,
+        cc_state: &CcState,
         channel_sf: &ChannelSoundfont,
         max_layers: Option<usize>,
     ) {
         match event {
             KeyNoteEvent::On(vel) => {
                 let before = self.voices.voice_count();
-                let voices = channel_sf.spawn_voices_attack(control, self.key, vel);
+                let voices = channel_sf.spawn_voices_attack(control, cc_state, self.key, vel);
                 self.voices.push_voices(voices, max_layers);
                 let (total, releasing, killed) = self.voices.voice_state_counts();
                 log_event(format_args!(
@@ -71,7 +73,7 @@ impl KeyData {
                 let mut spawned_rt = 0usize;
                 if let Some(vel) = vel {
                     let before_rt = self.voices.voice_count();
-                    let voices = channel_sf.spawn_voices_release(control, self.key, vel);
+                    let voices = channel_sf.spawn_voices_release(control, cc_state, self.key, vel);
                     // MOVE FORK: push release-trigger voices with the
                     // is_releasing flag pre-set, so a SUBSEQUENT NoteOff
                     // on this key skips them and properly releases the
@@ -100,7 +102,7 @@ impl KeyData {
                 let release_vels = self.voices.release_all_groups_snapshot();
                 let n = release_vels.len();
                 for vel in release_vels {
-                    let voices = channel_sf.spawn_voices_release(control, self.key, vel);
+                    let voices = channel_sf.spawn_voices_release(control, cc_state, self.key, vel);
                     // MOVE FORK: same reason as the NoteOff path — RT
                     // voices must be pre-flagged as releasing.
                     self.voices.push_release_trigger_voices(voices, max_layers);

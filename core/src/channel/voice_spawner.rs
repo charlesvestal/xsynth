@@ -1,6 +1,6 @@
 use crate::soundfont::VoiceSpawner;
 
-use crate::voice::{Voice, VoiceControlData};
+use crate::voice::{CcState, Voice, VoiceControlData};
 
 pub struct VoiceSpawnerMatrix {
     voice_spawners_attack: Vec<Vec<Box<dyn VoiceSpawner>>>,
@@ -10,8 +10,9 @@ pub struct VoiceSpawnerMatrix {
 fn voice_iter_from_vec<'a>(
     vec: &'a [Box<dyn VoiceSpawner>],
     control: &'a VoiceControlData,
+    cc_state: &'a CcState,
 ) -> impl Iterator<Item = Box<dyn Voice>> + 'a {
-    vec.iter().map(move |voice| voice.spawn_voice(control))
+    vec.iter().map(move |voice| voice.spawn_voice(control, cc_state))
 }
 
 fn exclusive_classes_from_vec<'a>(
@@ -63,20 +64,22 @@ impl VoiceSpawnerMatrix {
     pub fn spawn_voices_attack<'a>(
         &'a self,
         control: &'a VoiceControlData,
+        cc_state: &'a CcState,
         key: u8,
         vel: u8,
     ) -> impl Iterator<Item = Box<dyn Voice>> + 'a {
-        voice_iter_from_vec(self.get_attack_spawners_vec_at(key, vel), control)
+        voice_iter_from_vec(self.get_attack_spawners_vec_at(key, vel), control, cc_state)
     }
 
     #[inline(always)]
     pub fn spawn_voices_release<'a>(
         &'a self,
         control: &'a VoiceControlData,
+        cc_state: &'a CcState,
         key: u8,
         vel: u8,
     ) -> impl Iterator<Item = Box<dyn Voice>> + 'a {
-        voice_iter_from_vec(self.get_release_spawners_vec_at(key, vel), control)
+        voice_iter_from_vec(self.get_release_spawners_vec_at(key, vel), control, cc_state)
     }
 
     #[inline(always)]

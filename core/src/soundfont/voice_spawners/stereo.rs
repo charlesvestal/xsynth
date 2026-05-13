@@ -13,9 +13,9 @@ use crate::{
 use crate::{
     voice::VoiceControlData,
     voice::{
-        BufferSamplers, EnvelopeParameters, SIMDConstant, SIMDConstantStereo,
+        BufferSamplers, CcState, EnvelopeParameters, SIMDConstant, SIMDConstantStereo,
         SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
-        SIMDVoiceControl, SIMDVoiceEnvelope, SampleReader, SampleReaderLoop,
+        SIMDVoiceControl, SIMDVoiceEnvelope, SIMDVoiceOnccAmp, SampleReader, SampleReaderLoop,
         SampleReaderLoopSustain, SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
     },
 };
@@ -36,6 +36,9 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     exclusive_class: Option<u8>,
     vel: u8,
     stream_params: AudioStreamParams,
+    /// MOVE FORK: live `volume_oncc` bindings — when non-empty the voice
+    /// gets a SIMDVoiceOnccAmp stage that polls the channel CC array.
+    volume_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -68,29 +71,31 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             exclusive_class: params.exclusive_class,
             vel,
             stream_params,
+            volume_oncc: params.volume_oncc.clone(),
             _s: PhantomData,
         }
     }
 
-    fn begin_voice(&self, control: &VoiceControlData) -> Box<dyn Voice> {
+    fn begin_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
         // Currently there's only the f32 buffer samples, more could be added in the future.
         #[allow(clippy::redundant_closure)]
-        self.make_sample_reader(control, |s| BufferSamplers::new_f32(s))
+        self.make_sample_reader(control, cc_state, |s| BufferSamplers::new_f32(s))
     }
 
     fn make_sample_reader<BS: 'static + BufferSampler>(
         &self,
         control: &VoiceControlData,
+        cc_state: &CcState,
         make_bs: impl Fn(Arc<SampleStorage>) -> BS,
     ) -> Box<dyn Voice> {
         match self.loop_params.mode {
-            LoopMode::LoopContinuous => self.make_sample_grabber(control, move |s| {
+            LoopMode::LoopContinuous => self.make_sample_grabber(control, cc_state, move |s| {
                 SampleReaderLoop::new(make_bs(s), self.loop_params.clone())
             }),
-            LoopMode::LoopSustain => self.make_sample_grabber(control, move |s| {
+            LoopMode::LoopSustain => self.make_sample_grabber(control, cc_state, move |s| {
                 SampleReaderLoopSustain::new(make_bs(s), self.loop_params.clone())
             }),
-            LoopMode::NoLoop | LoopMode::OneShot => self.make_sample_grabber(control, move |s| {
+            LoopMode::NoLoop | LoopMode::OneShot => self.make_sample_grabber(control, cc_state, move |s| {
                 SampleReaderNoLoop::new(make_bs(s), self.loop_params.clone())
             }),
         }
@@ -99,14 +104,15 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     fn make_sample_grabber<SR: 'static + SampleReader>(
         &self,
         control: &VoiceControlData,
+        cc_state: &CcState,
         make_bs: impl Fn(Arc<SampleStorage>) -> SR,
     ) -> Box<dyn Voice> {
         match self.interpolator {
             Interpolator::Nearest => {
-                self.generate_sampler(control, |s| SIMDNearestSampleGrabber::new(make_bs(s)))
+                self.generate_sampler(control, cc_state, |s| SIMDNearestSampleGrabber::new(make_bs(s)))
             }
             Interpolator::Linear => {
-                self.generate_sampler(control, |s| SIMDLinearSampleGrabber::new(make_bs(s)))
+                self.generate_sampler(control, cc_state, |s| SIMDLinearSampleGrabber::new(make_bs(s)))
             }
         }
     }
@@ -114,6 +120,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     fn generate_sampler<SG: 'static + SIMDSampleGrabber<S>>(
         &self,
         control: &VoiceControlData,
+        cc_state: &CcState,
         make_sampler: impl Fn(Arc<SampleStorage>) -> SG,
     ) -> Box<dyn Voice> {
         let left = make_sampler(self.samples[0].clone());
@@ -122,7 +129,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let pitch_fac = self.create_pitch_fac(control);
 
         let sampler = SIMDStereoVoiceSampler::new(left, right, pitch_fac);
-        self.apply_voice_params(sampler, control)
+        self.apply_voice_params(sampler, control, cc_state)
     }
 
     fn apply_velocity<Gen, Sample>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, Sample>
@@ -201,15 +208,44 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         Box::new(base)
     }
 
-    fn apply_voice_params<Gen>(&self, gen: Gen, control: &VoiceControlData) -> Box<dyn Voice>
+    fn apply_voice_params<Gen>(
+        &self,
+        gen: Gen,
+        control: &VoiceControlData,
+        cc_state: &CcState,
+    ) -> Box<dyn Voice>
     where
         Gen: 'static + SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
     {
         let gen = self.apply_velocity(gen);
+        let gen = self.apply_volume_oncc(gen, cc_state);
         let gen = self.apply_pan(gen);
         let gen = self.apply_envelope(gen, control);
 
         self.apply_cutoff_effect(gen)
+    }
+
+    /// MOVE FORK: live volume modulation via SFZ `volume_oncc<N>=<dB>`.
+    /// The SIMDVoiceOnccAmp stage is always inserted to keep the
+    /// generator chain monomorphic; when bindings are empty its
+    /// `static_amp` short-circuit returns a permanent `set1(1.0)` and
+    /// the cost matches the velocity `SIMDConstant` stage (one SIMD
+    /// multiply per sample-width). On regions with non-empty bindings
+    /// the stage polls the channel's CC atomic array on a counter
+    /// (RECOMPUTE_INTERVAL — see voice/oncc_amp.rs) and produces the
+    /// per-voice amp multiplier `db_to_amp(Σ delta·cc/127)`.
+    fn apply_volume_oncc<Gen, Sample>(
+        &self,
+        gen: Gen,
+        cc_state: &CcState,
+    ) -> impl SIMDVoiceGenerator<S, Sample>
+    where
+        Sample: SIMDSample<S>,
+        SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
+        Gen: SIMDVoiceGenerator<S, Sample>,
+    {
+        let oncc = SIMDVoiceOnccAmp::<S>::new(cc_state.clone(), self.volume_oncc.clone());
+        VoiceCombineSIMD::mult(oncc, gen)
     }
 
     fn apply_cutoff_effect(
@@ -226,8 +262,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
 }
 
 impl<S: 'static + Sync + Send + Simd> VoiceSpawner for StereoSampledVoiceSpawner<S> {
-    fn spawn_voice(&self, control: &VoiceControlData) -> Box<dyn Voice> {
-        self.begin_voice(control)
+    fn spawn_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
+        self.begin_voice(control, cc_state)
     }
 
     fn exclusive_class(&self) -> Option<u8> {
