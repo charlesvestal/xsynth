@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{FilterType, LoopMode};
+use super::region::TriggerType;
 
 use self::defines::apply_defines;
 
@@ -46,6 +47,7 @@ pub enum SfzOpcode {
     DefaultPath(String),
     Tune(i16),
     AmpegEnvelope(SfzAmpegEnvelope),
+    Trigger(TriggerType),
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +212,18 @@ fn parse_filter_kind(val: &str) -> Option<FilterType> {
     }
 }
 
+fn parse_trigger(val: &str) -> Option<TriggerType> {
+    match val {
+        "attack" => Some(TriggerType::Attack),
+        "release" => Some(TriggerType::Release),
+        // first / legato exist in the SFZ spec but xsynth doesn't model
+        // those triggers; default to Attack so they behave as standard
+        // note-on regions rather than silently disappear.
+        "first" | "legato" => Some(TriggerType::Attack),
+        _ => None,
+    }
+}
+
 fn parse_loop_mode(val: &str) -> Option<LoopMode> {
     match val {
         "no_loop" => Some(LoopMode::NoLoop),
@@ -261,6 +275,7 @@ fn parse_sfz_opcode(
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),
+        "trigger" => parse_trigger(val).map(Trigger),
 
         "ampeg_delay" => parse_float_in_range(val, 0.0..=100.0)
             .map(AmpegDelay)

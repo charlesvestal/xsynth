@@ -6,7 +6,7 @@ mod grammar;
 mod parse;
 mod region;
 pub use parse::{SfzParseError, SfzValidationError};
-pub use region::{AmpegEnvelopeParams, RegionParams};
+pub use region::{AmpegEnvelopeParams, RegionParams, TriggerType};
 
 /// Parses an SFZ file and returns its regions in a vector.
 pub fn parse_soundfont(sfz_path: impl Into<PathBuf>) -> Result<Vec<RegionParams>, SfzParseError> {

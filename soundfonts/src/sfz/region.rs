@@ -8,6 +8,21 @@ use crate::{FilterType, LoopMode};
 
 use super::parse::{SfzAmpegEnvelope, SfzGroupType, SfzOpcode, SfzToken};
 
+/// MOVE FORK: SFZ `trigger=` opcode. Regions default to Attack (spawn
+/// on NoteOn). Release-trigger regions spawn on NoteOff instead and
+/// generally play key-up samples (mechanical thumps, dampener noise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerType {
+    Attack,
+    Release,
+}
+
+impl Default for TriggerType {
+    fn default() -> Self {
+        TriggerType::Attack
+    }
+}
+
 /// Structure that holds the opcode parameters of the SFZ's AmpEG envelope.
 #[derive(Debug, Clone)]
 pub struct AmpegEnvelopeParams {
@@ -80,6 +95,7 @@ pub(crate) struct RegionParamsBuilder {
     filter_type: FilterType,
     ampeg_envelope: AmpegEnvelopeParams,
     tune: i16,
+    trigger: TriggerType,
 }
 
 impl Default for RegionParamsBuilder {
@@ -112,6 +128,7 @@ impl Default for RegionParamsBuilder {
             filter_type: FilterType::default(),
             ampeg_envelope: AmpegEnvelopeParams::default(),
             tune: 0,
+            trigger: TriggerType::Attack,
         }
     }
 }
@@ -151,6 +168,7 @@ impl RegionParamsBuilder {
             SfzOpcode::DefaultPath(val) => self.default_path = Some(val),
             SfzOpcode::AmpegEnvelope(flag) => self.ampeg_envelope.update_from_flag(flag),
             SfzOpcode::Tune(val) => self.tune = val,
+            SfzOpcode::Trigger(val) => self.trigger = val,
         }
     }
 
@@ -192,6 +210,7 @@ impl RegionParamsBuilder {
             filter_type: self.filter_type,
             ampeg_envelope: self.ampeg_envelope,
             tune: self.tune,
+            trigger: self.trigger,
         })
     }
 }
@@ -223,6 +242,7 @@ pub struct RegionParams {
     pub filter_type: FilterType,
     pub ampeg_envelope: AmpegEnvelopeParams,
     pub tune: i16,
+    pub trigger: TriggerType,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
@@ -257,13 +277,20 @@ pub(super) fn parse_sf_root(
                 if let Some(group_level) = get_group_level(group) {
                     current_group = Some(group);
 
+                    // MOVE FORK: when entering a new header at level N
+                    // (e.g. a fresh `<group>` after a previous `<group>`),
+                    // pop the stale level-N (and any deeper) entry first
+                    // so the new entry inherits from its parent (level
+                    // N-1) rather than carrying the previous sibling's
+                    // opcodes. Without this, `trigger=release` from one
+                    // group leaked into every subsequent group, making
+                    // full attack-trigger samples fire on note-off.
+                    while group_data_stack.len() >= group_level {
+                        group_data_stack.pop_back();
+                    }
                     while group_data_stack.len() < group_level {
                         let parent_group = group_data_stack.back().cloned().unwrap_or_default();
                         group_data_stack.push_back(parent_group);
-                    }
-
-                    while group_data_stack.len() > group_level {
-                        group_data_stack.pop_back();
                     }
                 } else {
                     current_group = None;

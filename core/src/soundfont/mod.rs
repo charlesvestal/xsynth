@@ -13,6 +13,7 @@ use biquad::Q_BUTTERWORTH_F32;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
 use xsynth_soundfonts::{convert_sample_index, FilterType, LoopMode};
+use xsynth_soundfonts::sfz::TriggerType;
 
 use self::audio::load_audio_file;
 pub use self::audio::AudioLoadError;
@@ -89,6 +90,11 @@ pub(super) struct SoundfontInstrument {
     bank: u8,
     preset: u8,
     spawner_params_list: Vec<Vec<Arc<SampleVoiceSpawnerParams>>>,
+    /// MOVE FORK: release-trigger spawners, segregated from attack so
+    /// `trigger=release` SFZ regions fire on NoteOff and stay silent on
+    /// NoteOn. xsynth's get_release_voice_spawners_at was previously a
+    /// stub returning empty — now it returns these.
+    release_spawner_params_list: Vec<Vec<Arc<SampleVoiceSpawnerParams>>>,
 }
 
 /// Represents a sample soundfont to be used within XSynth.
@@ -297,10 +303,12 @@ impl SampleSoundfont {
             .collect();
         let samples = samples?;
 
-        // Generate region params
+        // Generate region params. MOVE FORK: parallel attack + release lists.
         let mut spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
+        let mut release_spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
         for _ in 0..(128 * 128) {
             spawner_params_list.push(Vec::new());
+            release_spawner_params_list.push(Vec::new());
         }
 
         // Write region params
@@ -411,7 +419,12 @@ impl SampleSoundfont {
                         exclusive_class: None,
                     });
 
-                    spawner_params_list[index].push(spawner_params.clone());
+                    match region.trigger {
+                        TriggerType::Release => release_spawner_params_list[index]
+                            .push(spawner_params.clone()),
+                        TriggerType::Attack => spawner_params_list[index]
+                            .push(spawner_params.clone()),
+                    }
                 }
             }
         }
@@ -421,6 +434,7 @@ impl SampleSoundfont {
                 bank: options.bank.unwrap_or(0),
                 preset: options.preset.unwrap_or(0),
                 spawner_params_list,
+                release_spawner_params_list,
             }],
             stream_params,
         })
@@ -456,7 +470,11 @@ impl SampleSoundfont {
                 }
             }
 
+            // MOVE FORK: SF2 has no release-trigger concept; the release
+            // list is always empty here. Kept parallel to SFZ path for
+            // SoundfontInstrument's uniform shape.
             let mut spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
+            let release_spawner_params_list = vec![Vec::new(); 128 * 128];
             for _ in 0..(128 * 128) {
                 spawner_params_list.push(Vec::new());
             }
@@ -557,6 +575,7 @@ impl SampleSoundfont {
                 bank: preset.bank as u8,
                 preset: preset.preset as u8,
                 spawner_params_list,
+                release_spawner_params_list,
             };
             instruments.push(new);
         }
@@ -621,6 +640,7 @@ impl SoundfontBase for SampleSoundfont {
             bank: 0,
             preset: 0,
             spawner_params_list: Vec::new(),
+            release_spawner_params_list: Vec::new(),
         };
 
         let instrument = self
@@ -634,11 +654,54 @@ impl SoundfontBase for SampleSoundfont {
 
     fn get_release_voice_spawners_at(
         &self,
-        _bank: u8,
-        _preset: u8,
-        _key: u8,
-        _vel: u8,
+        bank: u8,
+        preset: u8,
+        key: u8,
+        vel: u8,
     ) -> Vec<Box<dyn VoiceSpawner>> {
-        vec![]
+        use simdeez::*;
+        use simdeez::prelude::*;
+
+        simd_runtime_generate!(
+            fn get(
+                key: u8,
+                vel: u8,
+                sf: &SoundfontInstrument,
+                stream_params: &AudioStreamParams,
+            ) -> Vec<Box<dyn VoiceSpawner>> {
+                if sf.release_spawner_params_list.is_empty() {
+                    return Vec::new();
+                }
+
+                let index = key_vel_to_index(key, vel);
+                let mut vec = Vec::<Box<dyn VoiceSpawner>>::new();
+                for spawner in &sf.release_spawner_params_list[index] {
+                    match stream_params.channels {
+                        ChannelCount::Stereo => vec.push(Box::new(
+                            StereoSampledVoiceSpawner::<S>::new(spawner, vel, *stream_params),
+                        )),
+                        ChannelCount::Mono => vec.push(Box::new(
+                            MonoSampledVoiceSpawner::<S>::new(spawner, vel, *stream_params),
+                        )),
+                    }
+                }
+                vec
+            }
+        );
+
+        let empty = SoundfontInstrument {
+            bank: 0,
+            preset: 0,
+            spawner_params_list: Vec::new(),
+            release_spawner_params_list: Vec::new(),
+        };
+
+        let instrument = self
+            .instruments
+            .iter()
+            .find(|i| i.bank == bank && i.preset == preset)
+            .unwrap_or(&empty);
+
+        get(key, vel, instrument, self.stream_params())
     }
 }
