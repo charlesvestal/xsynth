@@ -41,15 +41,20 @@ pub trait SIMDSampleGrabber<S: Simd>: Send + Sync {
     fn signal_release(&mut self);
 }
 
-// F32 sampler
+// MOVE FORK: samples are stored as i16 internally to halve memory footprint
+// vs xsynth's original f32. Converted to f32 at the read boundary; the cost
+// is one mul per sample which is negligible compared to interpolation +
+// envelope + filter work.
 
-pub struct F32BufferSampler(Arc<[f32]>);
+pub struct I16BufferSampler(Arc<[i16]>);
 
-impl BufferSampler for F32BufferSampler {
+const I16_TO_F32: f32 = 1.0 / 32768.0;
+
+impl BufferSampler for I16BufferSampler {
     #[inline(always)]
     fn get(&self, pos: usize) -> f32 {
         match self.0.get(pos) {
-            Some(v) => *v,
+            Some(&v) => (v as f32) * I16_TO_F32,
             None => 0.0,
         }
     }
@@ -62,13 +67,13 @@ impl BufferSampler for F32BufferSampler {
 // Generalized enum sampler
 
 pub enum BufferSamplers {
-    F32(F32BufferSampler),
+    I16(I16BufferSampler),
 }
 
 impl BufferSamplers {
     #[inline(always)]
-    pub fn new_f32(sample: Arc<[f32]>) -> BufferSamplers {
-        BufferSamplers::F32(F32BufferSampler(sample))
+    pub fn new_f32(sample: Arc<[i16]>) -> BufferSamplers {
+        BufferSamplers::I16(I16BufferSampler(sample))
     }
 }
 
@@ -76,13 +81,13 @@ impl BufferSampler for BufferSamplers {
     #[inline(always)]
     fn get(&self, pos: usize) -> f32 {
         match self {
-            BufferSamplers::F32(sampler) => sampler.get(pos),
+            BufferSamplers::I16(sampler) => sampler.get(pos),
         }
     }
 
     fn length(&self) -> usize {
         match self {
-            BufferSamplers::F32(sampler) => sampler.length(),
+            BufferSamplers::I16(sampler) => sampler.length(),
         }
     }
 }

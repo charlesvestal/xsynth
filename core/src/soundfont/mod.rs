@@ -78,7 +78,7 @@ struct SampleVoiceSpawnerParams {
     filter_type: FilterType,
     loop_params: LoopParams,
     envelope: Arc<EnvelopeParameters>,
-    sample: Arc<[Arc<[f32]>]>,
+    sample: Arc<[Arc<[i16]>]>,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
 }

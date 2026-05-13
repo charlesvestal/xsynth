@@ -30,7 +30,7 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     loop_params: LoopParams,
     amp: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
-    samples: Arc<[Arc<[f32]>]>,
+    samples: Arc<[Arc<[i16]>]>,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
     vel: u8,
@@ -79,7 +79,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
     fn make_sample_reader<BS: 'static + BufferSampler>(
         &self,
         control: &VoiceControlData,
-        make_bs: impl Fn(Arc<[f32]>) -> BS,
+        make_bs: impl Fn(Arc<[i16]>) -> BS,
     ) -> Box<dyn Voice> {
         match self.loop_params.mode {
             LoopMode::LoopContinuous => self.make_sample_grabber(control, move |s| {
@@ -97,7 +97,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
     fn make_sample_grabber<SR: 'static + SampleReader>(
         &self,
         control: &VoiceControlData,
-        make_bs: impl Fn(Arc<[f32]>) -> SR,
+        make_bs: impl Fn(Arc<[i16]>) -> SR,
     ) -> Box<dyn Voice> {
         match self.interpolator {
             Interpolator::Nearest => {
@@ -112,7 +112,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
     fn generate_sampler<SG: 'static + SIMDSampleGrabber<S>>(
         &self,
         control: &VoiceControlData,
-        make_sampler: impl Fn(Arc<[f32]>) -> SG,
+        make_sampler: impl Fn(Arc<[i16]>) -> SG,
     ) -> Box<dyn Voice> {
         let sample = make_sampler(self.samples[0].clone());
 

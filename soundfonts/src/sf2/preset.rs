@@ -315,7 +315,7 @@ fn sustain_cb_to_percent(cb: f32) -> f32 {
     10f32.powf(-cb.max(0.0) / 200.0) * 100.0
 }
 
-fn build_region_samples(sample: &Sf2Sample, sample_data: &[Sf2Sample]) -> Arc<[Arc<[f32]>]> {
+fn build_region_samples(sample: &Sf2Sample, sample_data: &[Sf2Sample]) -> Arc<[Arc<[i16]>]> {
     match (sample.link_type, sample.linked_sample) {
         (Sf2SampleLinkType::Left, Some(linked)) => {
             if let Some(right) = sample_data.get(linked as usize) {

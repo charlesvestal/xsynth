@@ -26,7 +26,7 @@ pub enum AudioLoadError {
     NoTracks(PathBuf),
 }
 
-type ProcessedSample = (Arc<[Arc<[f32]>]>, u32);
+type ProcessedSample = (Arc<[Arc<[i16]>]>, u32);
 
 pub(super) fn load_audio_file(
     path: &PathBuf,
@@ -159,7 +159,7 @@ impl BuilderVecs {
         sample_rate: f32,
         new_sample_rate: f32,
         channels: ChannelCount,
-    ) -> Arc<[Arc<[f32]>]> {
+    ) -> Arc<[Arc<[i16]>]> {
         let mut vecs = self.vecs;
 
         if channels == ChannelCount::Mono && vecs.len() >= 2 {

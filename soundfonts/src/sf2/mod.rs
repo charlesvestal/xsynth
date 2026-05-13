@@ -35,7 +35,7 @@ pub enum Sf2ParseError {
 /// omitted.
 #[derive(Clone, Debug)]
 pub struct Sf2Region {
-    pub sample: Arc<[Arc<[f32]>]>,
+    pub sample: Arc<[Arc<[i16]>]>,
     pub sample_rate: u32,
     pub velrange: RangeInclusive<u8>,
     pub keyrange: RangeInclusive<u8>,

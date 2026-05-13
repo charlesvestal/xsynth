@@ -9,7 +9,7 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct Sf2Sample {
-    pub data: Arc<[f32]>,
+    pub data: Arc<[i16]>,
     pub link_type: Sf2SampleLinkType,
     pub linked_sample: Option<u16>,
     pub original_length: u32,
@@ -93,7 +93,15 @@ impl Sf2Sample {
                 data: if h.sample_rate != sample_rate && !sample.is_empty() {
                     resample_vec(sample, h.sample_rate as f32, sample_rate as f32)
                 } else {
-                    sample.into()
+                    // MOVE FORK: i16 storage — convert pass-through samples.
+                    sample.into_iter()
+                        .map(|s| {
+                            let v = (s * 32767.0).round();
+                            if v <= i16::MIN as f32 { i16::MIN }
+                            else if v >= i16::MAX as f32 { i16::MAX }
+                            else { v as i16 }
+                        })
+                        .collect()
                 },
                 link_type: h.sample_type.into(),
                 linked_sample: match h.sample_type.into() {
