@@ -51,13 +51,35 @@ impl ChannelSoundfont {
 
     pub fn set_soundfonts(&mut self, soundfonts: Vec<Arc<dyn SoundfontBase>>) {
         if !are_arc_vecs_equal(&self.soundfonts, &soundfonts) {
+            let t_start = std::time::Instant::now();
+            let old_count = self.soundfonts.len();
+            let new_count = soundfonts.len();
             let old = std::mem::replace(&mut self.soundfonts, soundfonts);
+            let t_after_replace = t_start.elapsed().as_micros();
             if let Some(sink) = &self.drop_sink {
                 if let Ok(mut q) = sink.lock() {
                     q.extend(old);
                 }
             }
+            let t_after_sink = t_start.elapsed().as_micros();
             self.rebuild_matrix();
+            let t_total = t_start.elapsed().as_micros();
+            // MOVE FORK: write to a known file so the Move host can grep
+            // it. stderr isn't captured anywhere we can read.
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[xsynth] set_soundfonts: old={} new={} replace={}us sink={}us rebuild={}us total={}us",
+                    old_count, new_count, t_after_replace,
+                    t_after_sink - t_after_replace,
+                    t_total - t_after_sink, t_total
+                );
+            }
         }
     }
 
@@ -69,16 +91,36 @@ impl ChannelSoundfont {
     }
 
     fn rebuild_matrix(&mut self) {
-        // If a preset/instr. is missing from all banks it will be muted,
-        // if a preset/instr. has regions in bank 0, all missing banks will be replaced by 0,
-        // if a preset/instr. has regions in any bank other than 0, all missing banks will be muted.
-        // For drum patches the same applies with bank and preset switched.
+        // MOVE FORK: instrument rebuild to find where it hangs/crashes.
+        // Writes a heartbeat to xsynth_debug.log every ~quarter through.
+        let t_start = std::time::Instant::now();
+        let dbg = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+            .ok();
+        let log = |msg: String| {
+            if let Some(mut f) = dbg.as_ref().and_then(|f| f.try_clone().ok()) {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", msg);
+            }
+        };
+        log(format!("[xsynth] rebuild_matrix: ENTER sf_count={}", self.soundfonts.len()));
 
         let bank = self.curr_program.bank;
         let preset = self.curr_program.preset;
 
         for k in 0..128u8 {
             for v in 0..128u8 {
+                // Heartbeat every 4k iterations (4 times during full rebuild).
+                let iter = (k as usize) * 128 + (v as usize);
+                if iter % 4096 == 0 {
+                    log(format!(
+                        "[xsynth] rebuild_matrix: iter={} elapsed={}us",
+                        iter,
+                        t_start.elapsed().as_micros()
+                    ));
+                }
                 let find_replacement_attack = || {
                     if bank == 128 {
                         self.soundfonts
@@ -127,6 +169,7 @@ impl ChannelSoundfont {
                 self.matrix.set_spawners_release(k, v, release_spawners);
             }
         }
+        log(format!("[xsynth] rebuild_matrix: EXIT elapsed={}us", t_start.elapsed().as_micros()));
     }
 
     pub fn spawn_voices_attack<'a>(
