@@ -48,6 +48,43 @@ pub enum SfzOpcode {
     Tune(i16),
     AmpegEnvelope(SfzAmpegEnvelope),
     Trigger(TriggerType),
+    SeqLength(u32),
+    SeqPosition(u32),
+    /// MOVE FORK: ARIA `set_cc<N>=v` or `set_hdcc<N>=v`. Stores the
+    /// channel's initial CC<N> value (normalized 0..1) into the parser's
+    /// CC state for later use by `_oncc` modulator opcodes.
+    AriaCcInit(u8, f32),
+    /// MOVE FORK: ARIA `<base>_oncc<N>=v` modulator. parse_sf_root
+    /// resolves it by looking up CC<N>'s init value and adding the
+    /// scaled contribution `v * cc_init` to the matching base opcode.
+    /// Currently limited to ampeg_* — covers the case where a serious
+    /// SFZ library relies on a CC72-style release knob (Splendid Grand
+    /// Piano: `ampeg_release_oncc72=2` with `set_hdcc72=0.35` baked as
+    /// `ampeg_release += 0.7`). Without this support those presets
+    /// load with the default 10 ms release and sound abrupt.
+    AriaOncc {
+        base: AriaOnccBase,
+        cc: u8,
+        value: f32,
+    },
+    /// MOVE FORK: `locc<N>=<v>` — region/group only fires when CC<N> ≥ v.
+    /// Statically evaluated against the parser's ARIA CC state at region
+    /// build time. (No live CC modulation yet; regions that don't pass
+    /// at the default CC state are dropped entirely.)
+    LoCc(u8, u8),
+    /// MOVE FORK: `hicc<N>=<v>` — region/group only fires when CC<N> ≤ v.
+    HiCc(u8, u8),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AriaOnccBase {
+    AmpegAttack,
+    AmpegHold,
+    AmpegDecay,
+    AmpegSustain,
+    AmpegRelease,
+    AmpegDelay,
+    AmpegStart,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +285,79 @@ fn parse_sfz_opcode(
     let val = val.as_ref();
     let name = name.as_ref();
 
+    // MOVE FORK: ARIA `set_cc<N>` / `set_hdcc<N>` — control-block CC
+    // initializer. parse_sf_root collects these to bake `_oncc` values.
+    if let Some(rest) = name.strip_prefix("set_hdcc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<f32>() {
+                return Ok(Some(AriaCcInit(n, v.clamp(0.0, 1.0))));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(rest) = name.strip_prefix("set_cc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(AriaCcInit(n, (v as f32 / 127.0).clamp(0.0, 1.0))));
+            }
+        }
+        return Ok(None);
+    }
+
+    // MOVE FORK: locc<N>=v / hicc<N>=v — static CC-range gating for
+    // regions/groups. Parsed here, resolved against the parser's
+    // cc_state at region build time.
+    if let Some(rest) = name.strip_prefix("locc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(LoCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(rest) = name.strip_prefix("hicc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(HiCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+
+    // MOVE FORK: ARIA `<base>_oncc<N>` modulator. parse_sf_root resolves
+    // the CC value and adds the scaled contribution to the base opcode.
+    // We only recognize a closed set of base names (ampeg_*) — others are
+    // silently ignored, matching xsynth's previous behavior for unknown
+    // opcodes. `_curvecc` variants also silently fall through (no curve
+    // support; using a linear approximation as if curve=0).
+    if let Some(idx) = name.find("_oncc") {
+        let base_name = &name[..idx];
+        let cc_part = &name[idx + "_oncc".len()..];
+        if let Ok(cc_n) = cc_part.parse::<u8>() {
+            let base = match base_name {
+                "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
+                "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
+                "ampeg_decay" => Some(AriaOnccBase::AmpegDecay),
+                "ampeg_sustain" => Some(AriaOnccBase::AmpegSustain),
+                "ampeg_release" | "ampeg_releasecc" => Some(AriaOnccBase::AmpegRelease),
+                "ampeg_delay" => Some(AriaOnccBase::AmpegDelay),
+                "ampeg_start" => Some(AriaOnccBase::AmpegStart),
+                _ => None,
+            };
+            if let Some(base) = base {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(AriaOncc { base, cc: cc_n, value: v }));
+                }
+            }
+        }
+        // unrecognized _oncc: silently drop
+        return Ok(None);
+    }
+    // Same for `_curvecc<N>` — silently drop (no curve support yet).
+    if name.contains("_curvecc") || name.contains("_curve_cc") {
+        return Ok(None);
+    }
+
     Ok(match name {
         "lokey" => parse_key_number(val).map(Lokey),
         "hikey" => parse_key_number(val).map(Hikey),
@@ -276,6 +386,8 @@ fn parse_sfz_opcode(
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),
         "trigger" => parse_trigger(val).map(Trigger),
+        "seq_length" | "seqlength" => parse_u32_in_range(val, 0..=255).map(SeqLength),
+        "seq_position" | "seqposition" => parse_u32_in_range(val, 0..=255).map(SeqPosition),
 
         "ampeg_delay" => parse_float_in_range(val, 0.0..=100.0)
             .map(AmpegDelay)

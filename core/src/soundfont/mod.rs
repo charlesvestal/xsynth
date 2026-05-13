@@ -84,6 +84,10 @@ struct SampleVoiceSpawnerParams {
     sample: Arc<[Arc<SampleStorage>]>,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
+    /// MOVE FORK: SFZ round-robin position (1-based) within an RR set.
+    /// 0 means "always fire" (no RR). When >0, this spawner only fires
+    /// on the NoteOn whose `RrState::counter` lands on this position.
+    seq_position: u8,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -95,6 +99,18 @@ pub(super) struct SoundfontInstrument {
     /// NoteOn. xsynth's get_release_voice_spawners_at was previously a
     /// stub returning empty — now it returns these.
     release_spawner_params_list: Vec<Vec<Arc<SampleVoiceSpawnerParams>>>,
+    /// MOVE FORK: round-robin counters, one per (key, vel) slot. None
+    /// means "no RR at this slot" (the attack-spawner list fires
+    /// unfiltered). Some({ seq_length, counter }) means each NoteOn
+    /// increments counter and only spawners whose `seq_position`
+    /// matches (counter % seq_length + 1) fire. seq_position == 0
+    /// always fires regardless.
+    rr_state: Vec<Option<RrState>>,
+}
+
+pub(super) struct RrState {
+    seq_length: u8,
+    counter: std::sync::atomic::AtomicU32,
 }
 
 /// Represents a sample soundfont to be used within XSynth.
@@ -306,6 +322,9 @@ impl SampleSoundfont {
         // Generate region params. MOVE FORK: parallel attack + release lists.
         let mut spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
         let mut release_spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
+        // MOVE FORK: track max seq_length per (key, vel) so we can build
+        // rr_state with the right rotation period after the loop.
+        let mut rr_seq_length = vec![0u8; 128 * 128];
         for _ in 0..(128 * 128) {
             spawner_params_list.push(Vec::new());
             release_spawner_params_list.push(Vec::new());
@@ -417,7 +436,19 @@ impl SampleSoundfont {
                         loop_params,
                         sample: region_samples,
                         exclusive_class: None,
+                        seq_position: region.seq_position.min(u8::MAX as u32) as u8,
                     });
+
+                    // MOVE FORK: track max seq_length seen at this slot
+                    // so rr_state has the right rotation period. Regions
+                    // that share seq_length at one (key, vel) form one
+                    // RR set; any non-zero seq_length triggers RR.
+                    if region.seq_length > 0 {
+                        let v = region.seq_length.min(u8::MAX as u32) as u8;
+                        if rr_seq_length[index] < v {
+                            rr_seq_length[index] = v;
+                        }
+                    }
 
                     match region.trigger {
                         TriggerType::Release => release_spawner_params_list[index]
@@ -429,12 +460,29 @@ impl SampleSoundfont {
             }
         }
 
+        // MOVE FORK: materialize per-slot RR state from the tracked
+        // seq_lengths. None for slots without any RR region.
+        let rr_state: Vec<Option<RrState>> = rr_seq_length
+            .into_iter()
+            .map(|len| {
+                if len == 0 {
+                    None
+                } else {
+                    Some(RrState {
+                        seq_length: len,
+                        counter: std::sync::atomic::AtomicU32::new(0),
+                    })
+                }
+            })
+            .collect();
+
         Ok(SampleSoundfont {
             instruments: vec![SoundfontInstrument {
                 bank: options.bank.unwrap_or(0),
                 preset: options.preset.unwrap_or(0),
                 spawner_params_list,
                 release_spawner_params_list,
+                rr_state,
             }],
             stream_params,
         })
@@ -564,6 +612,7 @@ impl SampleSoundfont {
                             loop_params,
                             sample: sample_storage,
                             exclusive_class: region.exclusive_class,
+                            seq_position: 0, // SF2 has no round-robin concept
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());
@@ -576,6 +625,7 @@ impl SampleSoundfont {
                 preset: preset.preset as u8,
                 spawner_params_list,
                 release_spawner_params_list,
+                rr_state: (0..128 * 128).map(|_| None).collect(),
             };
             instruments.push(new);
         }
@@ -621,8 +671,28 @@ impl SoundfontBase for SampleSoundfont {
                 }
 
                 let index = key_vel_to_index(key, vel);
+                // MOVE FORK: round-robin position for this NoteOn. If
+                // rr_state[index] is Some, advance the counter; spawners
+                // with `seq_position` matching (counter % seq_length + 1)
+                // fire, others skip. seq_position==0 is "always fire".
+                let rr_position: Option<u8> = sf
+                    .rr_state
+                    .get(index)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|rr| {
+                        let prev = rr
+                            .counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (prev % rr.seq_length as u32) as u8 + 1
+                    });
+
                 let mut vec = Vec::<Box<dyn VoiceSpawner>>::new();
                 for spawner in &sf.spawner_params_list[index] {
+                    if let Some(pos) = rr_position {
+                        if spawner.seq_position != 0 && spawner.seq_position != pos {
+                            continue;
+                        }
+                    }
                     match stream_params.channels {
                         ChannelCount::Stereo => vec.push(Box::new(
                             StereoSampledVoiceSpawner::<S>::new(spawner, vel, *stream_params),
@@ -641,6 +711,7 @@ impl SoundfontBase for SampleSoundfont {
             preset: 0,
             spawner_params_list: Vec::new(),
             release_spawner_params_list: Vec::new(),
+            rr_state: Vec::new(),
         };
 
         let instrument = self
@@ -694,6 +765,7 @@ impl SoundfontBase for SampleSoundfont {
             preset: 0,
             spawner_params_list: Vec::new(),
             release_spawner_params_list: Vec::new(),
+            rr_state: Vec::new(),
         };
 
         let instrument = self

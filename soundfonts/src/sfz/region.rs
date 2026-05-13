@@ -4,9 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::collections::HashMap;
+
 use crate::{FilterType, LoopMode};
 
-use super::parse::{SfzAmpegEnvelope, SfzGroupType, SfzOpcode, SfzToken};
+use super::parse::{AriaOnccBase, SfzAmpegEnvelope, SfzGroupType, SfzOpcode, SfzToken};
 
 /// MOVE FORK: SFZ `trigger=` opcode. Regions default to Attack (spawn
 /// on NoteOn). Release-trigger regions spawn on NoteOff instead and
@@ -96,6 +98,14 @@ pub(crate) struct RegionParamsBuilder {
     ampeg_envelope: AmpegEnvelopeParams,
     tune: i16,
     trigger: TriggerType,
+    seq_length: u32,
+    seq_position: u32,
+    /// MOVE FORK: per-CC range gates. `(lo, hi)` per CC number; region
+    /// only fires if the static ARIA CC value (set_cc/set_hdcc at load)
+    /// is in [lo, hi]. Evaluated at build(); regions whose constraints
+    /// aren't satisfied are dropped entirely so they don't play
+    /// unconditionally. Default empty = unconstrained.
+    cc_ranges: HashMap<u8, (u8, u8)>,
 }
 
 impl Default for RegionParamsBuilder {
@@ -129,6 +139,9 @@ impl Default for RegionParamsBuilder {
             ampeg_envelope: AmpegEnvelopeParams::default(),
             tune: 0,
             trigger: TriggerType::Attack,
+            seq_length: 0,
+            seq_position: 0,
+            cc_ranges: HashMap::new(),
         }
     }
 }
@@ -169,10 +182,46 @@ impl RegionParamsBuilder {
             SfzOpcode::AmpegEnvelope(flag) => self.ampeg_envelope.update_from_flag(flag),
             SfzOpcode::Tune(val) => self.tune = val,
             SfzOpcode::Trigger(val) => self.trigger = val,
+            SfzOpcode::SeqLength(val) => self.seq_length = val,
+            SfzOpcode::SeqPosition(val) => self.seq_position = val,
+            SfzOpcode::LoCc(n, v) => {
+                let entry = self.cc_ranges.entry(n).or_insert((0, 127));
+                entry.0 = v;
+            }
+            SfzOpcode::HiCc(n, v) => {
+                let entry = self.cc_ranges.entry(n).or_insert((0, 127));
+                entry.1 = v;
+            }
+            // MOVE FORK: ARIA opcodes are resolved in parse_sf_root, not
+            // here. If one reaches update_from_flag it means the parent
+            // didn't intercept it — treat as no-op so the match stays
+            // exhaustive.
+            SfzOpcode::AriaCcInit(_, _) | SfzOpcode::AriaOncc { .. } => {}
         }
     }
 
-    fn build(self, base_path: &Path) -> Option<RegionParams> {
+    fn build(
+        self,
+        base_path: &Path,
+        cc_state: &HashMap<u8, f32>,
+    ) -> Option<RegionParams> {
+        // MOVE FORK: evaluate locc/hicc against static CC state. Regions
+        // whose CC constraints aren't satisfied at default load-time CC
+        // values get dropped (returning None). The CC value comes from
+        // `set_cc<N>` / `set_hdcc<N>` opcodes; default 0 for CCs the
+        // file didn't initialize. Splendid Grand Piano's resonance
+        // group requires `locc64=65` (sustain pedal) and `locc70=1`
+        // (resonance enable). Without this gating those regions fired
+        // unconditionally and bled a doubled, octave-shifted sample
+        // into every note.
+        for (&cc_n, &(lo, hi)) in self.cc_ranges.iter() {
+            let cc_v = cc_state.get(&cc_n).copied().unwrap_or(0.0);
+            let cc_int = (cc_v * 127.0).round().clamp(0.0, 127.0) as u8;
+            if cc_int < lo || cc_int > hi {
+                return None;
+            }
+        }
+
         let relative_sample_path = if let Some(default_path) = self.default_path {
             PathBuf::from(default_path).join(self.sample?)
         } else {
@@ -211,6 +260,8 @@ impl RegionParamsBuilder {
             ampeg_envelope: self.ampeg_envelope,
             tune: self.tune,
             trigger: self.trigger,
+            seq_length: self.seq_length,
+            seq_position: self.seq_position,
         })
     }
 }
@@ -243,6 +294,12 @@ pub struct RegionParams {
     pub ampeg_envelope: AmpegEnvelopeParams,
     pub tune: i16,
     pub trigger: TriggerType,
+    /// MOVE FORK: SFZ round-robin opcodes. `seq_length` is the total
+    /// number of RR variations (0 = no RR). `seq_position` is this
+    /// region's 1-based slot in the sequence (0 = always-fire, ignored
+    /// for RR rotation).
+    pub seq_length: u32,
+    pub seq_position: u32,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
@@ -263,13 +320,18 @@ pub(super) fn parse_sf_root(
     let mut current_group = None;
     let mut group_data_stack = VecDeque::<RegionParamsBuilder>::new();
     let mut regions = Vec::new();
+    // MOVE FORK: ARIA CC initial state, populated by `set_cc<N>` /
+    // `set_hdcc<N>` from the <control> block, consumed by `_oncc`
+    // modulators to bake their static contribution. Default 0 for any
+    // CC the file didn't initialize.
+    let mut cc_state: HashMap<u8, f32> = HashMap::new();
 
     for token in tokens {
         match token {
             SfzToken::Group(group) => {
                 if current_group == Some(SfzGroupType::Region) {
                     let next_region = group_data_stack.pop_back().unwrap();
-                    if let Some(built) = next_region.build(&base_path) {
+                    if let Some(built) = next_region.build(&base_path, &cc_state) {
                         regions.push(built);
                     }
                 }
@@ -296,6 +358,27 @@ pub(super) fn parse_sf_root(
                     current_group = None;
                 }
             }
+            SfzToken::Opcode(SfzOpcode::AriaCcInit(cc_n, value)) => {
+                cc_state.insert(cc_n, value);
+            }
+            SfzToken::Opcode(SfzOpcode::AriaOncc { base, cc, value }) => {
+                let cc_v = cc_state.get(&cc).copied().unwrap_or(0.0);
+                let contribution = value * cc_v;
+                if current_group.is_some() {
+                    if let Some(group_data) = group_data_stack.back_mut() {
+                        let env = &mut group_data.ampeg_envelope;
+                        match base {
+                            AriaOnccBase::AmpegAttack => env.ampeg_attack += contribution,
+                            AriaOnccBase::AmpegHold => env.ampeg_hold += contribution,
+                            AriaOnccBase::AmpegDecay => env.ampeg_decay += contribution,
+                            AriaOnccBase::AmpegSustain => env.ampeg_sustain += contribution,
+                            AriaOnccBase::AmpegRelease => env.ampeg_release += contribution,
+                            AriaOnccBase::AmpegDelay => env.ampeg_delay += contribution,
+                            AriaOnccBase::AmpegStart => env.ampeg_start += contribution,
+                        }
+                    }
+                }
+            }
             SfzToken::Opcode(flag) => {
                 if current_group.is_some() {
                     if let Some(group_data) = group_data_stack.back_mut() {
@@ -308,7 +391,7 @@ pub(super) fn parse_sf_root(
 
     if current_group == Some(SfzGroupType::Region) {
         let next_region = group_data_stack.pop_back().unwrap();
-        if let Some(built) = next_region.build(&base_path) {
+        if let Some(built) = next_region.build(&base_path, &cc_state) {
             regions.push(built);
         }
     }
