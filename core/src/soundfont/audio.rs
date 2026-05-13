@@ -72,12 +72,15 @@ fn try_mmap_cache(
     if mmap.len() < CACHE_HEADER_BYTES + n_chans * bytes_per_chan { return None; }
 
     let holder = Arc::new(MmapHolder { mmap });
+    // Hint the kernel that page-access is sparse: most samples sit cold,
+    // pages get hot only while a specific note is sustaining.
+    holder.advise_random();
     let channels: Vec<Arc<SampleStorage>> = (0..n_chans).map(|c| {
-        Arc::new(SampleStorage::Mapped {
-            holder: holder.clone(),
-            byte_offset: CACHE_HEADER_BYTES + c * bytes_per_chan,
+        Arc::new(SampleStorage::from_mmap(
+            holder.clone(),
+            CACHE_HEADER_BYTES + c * bytes_per_chan,
             frames,
-        })
+        ))
     }).collect();
     Some((channels.into(), src_rate))
 }
