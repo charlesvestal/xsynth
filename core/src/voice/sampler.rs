@@ -42,21 +42,22 @@ pub trait SIMDSampleGrabber<S: Simd>: Send + Sync {
 }
 
 // MOVE FORK: samples are stored as i16 internally to halve memory footprint
-// vs xsynth's original f32. Converted to f32 at the read boundary; the cost
-// is one mul per sample which is negligible compared to interpolation +
-// envelope + filter work.
+// vs xsynth's original f32. Storage is either heap or mmap'd cache; the
+// sampler is opaque to the choice via SampleStorage::get(pos) -> i16. The
+// per-read cost is one i16→f32 multiply, negligible compared to the
+// interpolation + envelope + filter work that follows.
 
-pub struct I16BufferSampler(Arc<[i16]>);
+use crate::soundfont::SampleStorage;
+
+pub struct I16BufferSampler(Arc<SampleStorage>);
 
 const I16_TO_F32: f32 = 1.0 / 32768.0;
 
 impl BufferSampler for I16BufferSampler {
     #[inline(always)]
     fn get(&self, pos: usize) -> f32 {
-        match self.0.get(pos) {
-            Some(&v) => (v as f32) * I16_TO_F32,
-            None => 0.0,
-        }
+        let v = self.0.get(pos);
+        (v as f32) * I16_TO_F32
     }
 
     fn length(&self) -> usize {
@@ -64,15 +65,13 @@ impl BufferSampler for I16BufferSampler {
     }
 }
 
-// Generalized enum sampler
-
 pub enum BufferSamplers {
     I16(I16BufferSampler),
 }
 
 impl BufferSamplers {
     #[inline(always)]
-    pub fn new_f32(sample: Arc<[i16]>) -> BufferSamplers {
+    pub fn new_f32(sample: Arc<SampleStorage>) -> BufferSamplers {
         BufferSamplers::I16(I16BufferSampler(sample))
     }
 }

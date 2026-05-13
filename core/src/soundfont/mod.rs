@@ -27,10 +27,12 @@ pub use xsynth_soundfonts::{sf2::Sf2ParseError, sfz::SfzParseError};
 
 mod audio;
 mod config;
+mod sample_storage;
 mod utils;
 mod voice_spawners;
 use utils::*;
 use voice_spawners::*;
+pub use sample_storage::{MmapHolder, SampleStorage};
 
 pub use config::*;
 
@@ -78,7 +80,7 @@ struct SampleVoiceSpawnerParams {
     filter_type: FilterType,
     loop_params: LoopParams,
     envelope: Arc<EnvelopeParameters>,
-    sample: Arc<[Arc<[i16]>]>,
+    sample: Arc<[Arc<SampleStorage>]>,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
 }
@@ -517,13 +519,20 @@ impl SampleSoundfont {
                             stop: Some(region.sample_end),
                         };
 
-                        let mut region_samples = region.sample.clone();
+                        let mut region_samples: Arc<[Arc<[i16]>]> = region.sample.clone();
                         if stream_params.channels == ChannelCount::Stereo
                             && region_samples.len() == 1
                         {
                             region_samples =
                                 Arc::new([region_samples[0].clone(), region_samples[0].clone()]);
                         }
+                        // MOVE FORK: SF2 ships Arc<[Arc<[i16]>]>; wrap each
+                        // per-channel buffer in SampleStorage::Heap so it
+                        // matches the unified SampleVoiceSpawnerParams type.
+                        let sample_storage: Arc<[Arc<SampleStorage>]> = region_samples
+                            .iter()
+                            .map(|c| Arc::new(SampleStorage::Heap(c.clone())))
+                            .collect();
 
                         let spawner_params = Arc::new(SampleVoiceSpawnerParams {
                             pan,
@@ -535,7 +544,7 @@ impl SampleSoundfont {
                             filter_type: FilterType::LowPass,
                             interpolator: options.interpolator,
                             loop_params,
-                            sample: region_samples,
+                            sample: sample_storage,
                             exclusive_class: region.exclusive_class,
                         });
 

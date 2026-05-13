@@ -1,4 +1,4 @@
-use std::{fs::File, io, path::PathBuf, sync::Arc};
+use std::{fs::File, io, io::Write, path::PathBuf, sync::Arc};
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::{audio::AudioBuffer, conv::IntoSample, probe::Hint, sample::Sample};
@@ -9,6 +9,117 @@ use symphonia::core::{codecs::DecoderOptions, errors::Error};
 use crate::{AudioStreamParams, ChannelCount};
 use thiserror::Error;
 use xsynth_soundfonts::resample::resample_vecs;
+
+/* MOVE FORK: per-sample mmap-backed cache. Layout (LE):
+ *   magic    [u8; 4]  = "X44Y"  ("X44" = decoded f32 → now Y for i16 v2)
+ *   version  u32      = 2
+ *   src_rate u32
+ *   tgt_rate u32
+ *   tgt_chs  u32  (1 mono, 2 stereo)
+ *   n_chans  u32
+ *   frames   u32  (per channel)
+ *   data     [i16; n_chans * frames]  (channel-contiguous)
+ *
+ * Voices read each i16 from the mmap'd region; OS pages out unused
+ * samples under memory pressure. */
+const CACHE_MAGIC: u32 = u32::from_le_bytes(*b"X44Y");
+const CACHE_VERSION: u32 = 2;
+const CACHE_HEADER_WORDS: usize = 7;
+const CACHE_HEADER_BYTES: usize = CACHE_HEADER_WORDS * 4;
+
+fn cache_path_for(source: &PathBuf) -> PathBuf {
+    let mut p = source.clone();
+    let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".x44c");
+    p.set_file_name(name);
+    p
+}
+
+fn try_read_u32(bytes: &[u8], i: usize) -> Option<u32> {
+    let start = i * 4;
+    if start + 4 > bytes.len() { return None; }
+    Some(u32::from_le_bytes([bytes[start], bytes[start+1], bytes[start+2], bytes[start+3]]))
+}
+
+fn try_mmap_cache(
+    source: &PathBuf,
+    target_rate: u32,
+    target_chans: ChannelCount,
+) -> Option<(Arc<[Arc<SampleStorage>]>, u32)> {
+    let cp = cache_path_for(source);
+    let src_meta = std::fs::metadata(source).ok()?;
+    let cache_meta = std::fs::metadata(&cp).ok()?;
+    let src_mtime = src_meta.modified().ok()?;
+    let cache_mtime = cache_meta.modified().ok()?;
+    if cache_mtime < src_mtime { return None; }
+
+    let file = File::open(&cp).ok()?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    if mmap.len() < CACHE_HEADER_BYTES { return None; }
+
+    if try_read_u32(&mmap, 0)? != CACHE_MAGIC { return None; }
+    if try_read_u32(&mmap, 1)? != CACHE_VERSION { return None; }
+    let src_rate = try_read_u32(&mmap, 2)?;
+    let cached_tgt_rate = try_read_u32(&mmap, 3)?;
+    let cached_tgt_chs = try_read_u32(&mmap, 4)?;
+    let n_chans = try_read_u32(&mmap, 5)? as usize;
+    let frames = try_read_u32(&mmap, 6)? as usize;
+
+    if cached_tgt_rate != target_rate { return None; }
+    if cached_tgt_chs != target_chans.count() as u32 { return None; }
+    if n_chans == 0 || frames == 0 || n_chans > 8 { return None; }
+    let bytes_per_chan = frames * 2;
+    if mmap.len() < CACHE_HEADER_BYTES + n_chans * bytes_per_chan { return None; }
+
+    let holder = Arc::new(MmapHolder { mmap });
+    let channels: Vec<Arc<SampleStorage>> = (0..n_chans).map(|c| {
+        Arc::new(SampleStorage::Mapped {
+            holder: holder.clone(),
+            byte_offset: CACHE_HEADER_BYTES + c * bytes_per_chan,
+            frames,
+        })
+    }).collect();
+    Some((channels.into(), src_rate))
+}
+
+fn try_write_cache(
+    source: &PathBuf,
+    target_rate: u32,
+    target_chans: ChannelCount,
+    src_rate: u32,
+    channels: &[Arc<[i16]>],
+) {
+    let cp = cache_path_for(source);
+    let mut tmp = cp.clone();
+    let mut tmpname = tmp.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmpname.push(".tmp");
+    tmp.set_file_name(tmpname);
+    let frames = channels.first().map(|c| c.len() as u32).unwrap_or(0);
+    let n_chans = channels.len() as u32;
+    if frames == 0 || n_chans == 0 { return; }
+
+    let Ok(f) = File::create(&tmp) else { return; };
+    let mut w = std::io::BufWriter::with_capacity(64 * 1024, f);
+    let hdr: [u32; CACHE_HEADER_WORDS] = [
+        CACHE_MAGIC, CACHE_VERSION, src_rate, target_rate,
+        target_chans.count() as u32, n_chans, frames,
+    ];
+    let mut hdr_bytes = [0u8; CACHE_HEADER_BYTES];
+    for (i, v) in hdr.iter().enumerate() {
+        hdr_bytes[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+    }
+    if w.write_all(&hdr_bytes).is_err() { return; }
+    for ch in channels.iter() {
+        if ch.len() as u32 != frames { return; }
+        // SAFETY: i16 is POD. Bulk write the channel data as bytes.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(ch.as_ptr() as *const u8, ch.len() * 2)
+        };
+        if w.write_all(bytes).is_err() { return; }
+    }
+    if w.into_inner().is_err() { return; }
+    let _ = std::fs::rename(&tmp, &cp);
+}
 
 /// Errors that can be generated when loading an audio file.
 #[derive(Debug, Error)]
@@ -26,13 +137,21 @@ pub enum AudioLoadError {
     NoTracks(PathBuf),
 }
 
-type ProcessedSample = (Arc<[Arc<[i16]>]>, u32);
+use super::sample_storage::{MmapHolder, SampleStorage};
+
+type ProcessedSample = (Arc<[Arc<SampleStorage>]>, u32);
 
 pub(super) fn load_audio_file(
     path: &PathBuf,
     stream_params: AudioStreamParams,
 ) -> Result<ProcessedSample, AudioLoadError> {
     let new_sample_rate = stream_params.sample_rate as f32;
+
+    // Cache hit: skip decode entirely; samples are mmap'd, RAM cost is
+    // bounded to actively-played pages.
+    if let Some(cached) = try_mmap_cache(path, stream_params.sample_rate, stream_params.channels) {
+        return Ok(cached);
+    }
 
     let extension = path.extension().and_then(|ext| ext.to_str());
 
@@ -108,9 +227,30 @@ pub(super) fn load_audio_file(
         }
     }
 
-    let built = builder.finish(sample_rate as f32, new_sample_rate, stream_params.channels);
+    let built_i16 = builder.finish(sample_rate as f32, new_sample_rate, stream_params.channels);
 
-    Ok((built, sample_rate))
+    // Write cache so subsequent loads are mmap-fast. Best effort; failure
+    // is harmless (we just decode again next time).
+    let chans_vec: Vec<Arc<[i16]>> = built_i16.iter().cloned().collect();
+    try_write_cache(
+        path,
+        stream_params.sample_rate,
+        stream_params.channels,
+        sample_rate,
+        &chans_vec,
+    );
+
+    // Try to mmap the freshly-written cache so even the first load benefits
+    // from page-eviction-under-pressure. Fall back to heap-wrapped storage
+    // if mmap fails (e.g. write failed silently).
+    if let Some(mapped) = try_mmap_cache(path, stream_params.sample_rate, stream_params.channels) {
+        return Ok(mapped);
+    }
+    let heap: Arc<[Arc<SampleStorage>]> = built_i16
+        .iter()
+        .map(|chan| Arc::new(SampleStorage::Heap(chan.clone())))
+        .collect();
+    Ok((heap, sample_rate))
 }
 
 struct BuilderVecs {
