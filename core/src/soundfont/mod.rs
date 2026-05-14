@@ -100,6 +100,14 @@ struct SampleVoiceSpawnerParams {
     /// Empty when the region has no volume_oncc opcodes (most SFZ
     /// files; non-DS-converted patches).
     volume_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `cutoff_oncc<N>=<cents>` bindings from the region.
+    /// Same Arc-shared semantics as volume_oncc. Unread by voice spawners
+    /// until the SIMD cutoff modulator lands.
+    cutoff_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `resonance_oncc<N>=<dB>` bindings from the region.
+    resonance_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings from the region.
+    pan_oncc: Arc<[(u8, f32)]>,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -351,9 +359,12 @@ impl SampleSoundfont {
                 continue;
             }
 
-            // MOVE FORK: one Arc per region for live `volume_oncc` bindings,
+            // MOVE FORK: one Arc per region for live `_oncc` bindings,
             // cloned cheaply into every (key, vel) spawner.
             let volume_oncc: Arc<[(u8, f32)]> = region.volume_oncc.clone().into();
+            let cutoff_oncc: Arc<[(u8, f32)]> = region.cutoff_oncc.clone().into();
+            let resonance_oncc: Arc<[(u8, f32)]> = region.resonance_oncc.clone().into();
+            let pan_oncc: Arc<[(u8, f32)]> = region.pan_oncc.clone().into();
 
             for key in region.keyrange.clone() {
                 for vel in region.velrange.clone() {
@@ -454,6 +465,9 @@ impl SampleSoundfont {
                         exclusive_class: None,
                         seq_position: region.seq_position.min(u8::MAX as u32) as u8,
                         volume_oncc: volume_oncc.clone(),
+                        cutoff_oncc: cutoff_oncc.clone(),
+                        resonance_oncc: resonance_oncc.clone(),
+                        pan_oncc: pan_oncc.clone(),
                     });
 
                     // MOVE FORK: track max seq_length seen at this slot
@@ -630,8 +644,11 @@ impl SampleSoundfont {
                             sample: sample_storage,
                             exclusive_class: region.exclusive_class,
                             seq_position: 0, // SF2 has no round-robin concept
-                            // SF2 has no `_oncc` surface; empty Arc.
+                            // SF2 has no `_oncc` surface; empty Arcs.
                             volume_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            cutoff_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            resonance_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            pan_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());

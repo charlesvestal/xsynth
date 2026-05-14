@@ -80,6 +80,17 @@ pub enum SfzOpcode {
     /// `db_to_amp(delta·cc/127)`. Multiple opcodes for the same region
     /// accumulate; duplicate CCs follow SFZ "last assignment wins".
     VolumeOncc(u8, f32),
+    /// MOVE FORK: `cutoff_oncc<N>=<cents>` — live filter cutoff modulation.
+    /// Cents offset applied to the base cutoff frequency: at CC=N, the
+    /// per-voice filter coefficients are recomputed for
+    /// `cutoff * 2^(cents·cc/127/1200)`.
+    CutoffOncc(u8, f32),
+    /// MOVE FORK: `resonance_oncc<N>=<dB>` — live filter resonance
+    /// modulation. dB offset added to the base resonance at CC=N.
+    ResonanceOncc(u8, f32),
+    /// MOVE FORK: `pan_oncc<N>=<percent>` — live pan modulation. Pan
+    /// offset (-100..100) added to the base pan at CC=N.
+    PanOncc(u8, f32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -346,6 +357,24 @@ fn parse_sfz_opcode(
             if base_name == "volume" {
                 if let Ok(v) = val.parse::<f32>() {
                     return Ok(Some(VolumeOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "cutoff" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(CutoffOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "resonance" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(ResonanceOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "pan" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(PanOncc(cc_n, v)));
                 }
                 return Ok(None);
             }

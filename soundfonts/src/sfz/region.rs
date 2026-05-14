@@ -114,6 +114,13 @@ pub(crate) struct RegionParamsBuilder {
     /// the parser/region/builder data path is in place before runtime
     /// support lands.
     volume_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `cutoff_oncc<N>=<cents>` bindings on this region.
+    /// See VolumeOncc for the accumulate / last-wins pattern.
+    cutoff_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `resonance_oncc<N>=<dB>` bindings on this region.
+    resonance_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
+    pan_oncc: Vec<(u8, f32)>,
 }
 
 impl Default for RegionParamsBuilder {
@@ -151,6 +158,9 @@ impl Default for RegionParamsBuilder {
             seq_position: 0,
             cc_ranges: HashMap::new(),
             volume_oncc: Vec::new(),
+            cutoff_oncc: Vec::new(),
+            resonance_oncc: Vec::new(),
+            pan_oncc: Vec::new(),
         }
     }
 }
@@ -210,6 +220,27 @@ impl RegionParamsBuilder {
                     existing.1 = db;
                 } else {
                     self.volume_oncc.push((cc, db));
+                }
+            }
+            SfzOpcode::CutoffOncc(cc, cents) => {
+                if let Some(existing) = self.cutoff_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = cents;
+                } else {
+                    self.cutoff_oncc.push((cc, cents));
+                }
+            }
+            SfzOpcode::ResonanceOncc(cc, db) => {
+                if let Some(existing) = self.resonance_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = db;
+                } else {
+                    self.resonance_oncc.push((cc, db));
+                }
+            }
+            SfzOpcode::PanOncc(cc, pct) => {
+                if let Some(existing) = self.pan_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = pct;
+                } else {
+                    self.pan_oncc.push((cc, pct));
                 }
             }
             // MOVE FORK: ARIA opcodes are resolved in parse_sf_root, not
@@ -283,6 +314,9 @@ impl RegionParamsBuilder {
             seq_length: self.seq_length,
             seq_position: self.seq_position,
             volume_oncc: self.volume_oncc,
+            cutoff_oncc: self.cutoff_oncc,
+            resonance_oncc: self.resonance_oncc,
+            pan_oncc: self.pan_oncc,
         })
     }
 }
@@ -326,6 +360,12 @@ pub struct RegionParams {
     /// xsynth-core today — will be consumed by a SIMD generator in a
     /// later Phase 3 step.
     pub volume_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `cutoff_oncc<N>=<cents>` bindings on this region.
+    pub cutoff_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `resonance_oncc<N>=<dB>` bindings on this region.
+    pub resonance_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
+    pub pan_oncc: Vec<(u8, f32)>,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
