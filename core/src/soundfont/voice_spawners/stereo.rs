@@ -13,10 +13,11 @@ use crate::{
 use crate::{
     voice::VoiceControlData,
     voice::{
-        BufferSamplers, CcState, EnvelopeParameters, SIMDConstant, SIMDConstantStereo,
+        BufferSamplers, CcState, EnvelopeParameters, SIMDConstant,
         SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
-        SIMDVoiceControl, SIMDVoiceEnvelope, SIMDVoiceOnccAmp, SampleReader, SampleReaderLoop,
-        SampleReaderLoopSustain, SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
+        SIMDVoiceControl, SIMDVoiceEnvelope, SIMDVoiceOnccAmp, SIMDVoicePan, SampleReader,
+        SampleReaderLoop, SampleReaderLoopSustain, SampleReaderNoLoop, Voice, VoiceBase,
+        VoiceCombineSIMD,
     },
 };
 
@@ -39,6 +40,9 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     /// MOVE FORK: live `volume_oncc` bindings — when non-empty the voice
     /// gets a SIMDVoiceOnccAmp stage that polls the channel CC array.
     volume_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `pan_oncc` bindings — fed to SIMDVoicePan which
+    /// replaces the static SIMDConstantStereo pan stage.
+    pan_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -72,6 +76,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             vel,
             stream_params,
             volume_oncc: params.volume_oncc.clone(),
+            pan_oncc: params.pan_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -143,20 +148,19 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         amp
     }
 
-    fn apply_pan<Gen, Sample>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, Sample>
+    /// MOVE FORK: pan stage is always a SIMDVoicePan — when bindings are
+    /// empty the generator's `static_pan` flag caches the gains once and
+    /// the cost matches the prior SIMDConstantStereo. With bindings, the
+    /// stage polls the CC atomic array on a counter and recomputes the
+    /// cos/sin equal-power gains live.
+    fn apply_pan<Gen, Sample>(&self, gen: Gen, cc_state: &CcState) -> impl SIMDVoiceGenerator<S, Sample>
     where
         Sample: SIMDSample<S>,
         SIMDSampleStereo<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
-        let pan = self.pan * std::f32::consts::PI / 2.0;
-        let leftg = (pan.cos() * 1.42).min(1.0);
-        let rightg = (pan.sin() * 1.42).min(1.0);
-
-        let gains = SIMDConstantStereo::<S>::new(leftg, rightg);
-
-        let panned = VoiceCombineSIMD::mult(gains, gen);
-        panned
+        let pan_gen = SIMDVoicePan::<S>::new(cc_state.clone(), self.pan_oncc.clone(), self.pan);
+        VoiceCombineSIMD::mult(pan_gen, gen)
     }
 
     fn create_pitch_fac(
@@ -219,7 +223,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     {
         let gen = self.apply_velocity(gen);
         let gen = self.apply_volume_oncc(gen, cc_state);
-        let gen = self.apply_pan(gen);
+        let gen = self.apply_pan(gen, cc_state);
         let gen = self.apply_envelope(gen, control);
 
         self.apply_cutoff_effect(gen)
