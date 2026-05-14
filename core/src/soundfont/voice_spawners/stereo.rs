@@ -6,7 +6,7 @@ use crate::{
     effects::BiQuadFilter,
     voice::{
         BufferSampler, SIMDSample, SIMDSampleGrabber, SIMDSampleMono, SIMDSampleStereo,
-        SIMDStereoVoiceCutoff, SIMDVoiceGenerator,
+        SIMDStereoVoiceCutoffLive, SIMDVoiceGenerator,
     },
     AudioStreamParams,
 };
@@ -28,6 +28,11 @@ use crate::soundfont::{Interpolator, LoopParams, SampleStorage, SampleVoiceSpawn
 pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     speed_mult: f32,
     filter: Option<BiQuadFilter>,
+    /// MOVE FORK: filter params kept around for live coefficient
+    /// recomputation by SIMDStereoVoiceCutoffLive.
+    filter_type: xsynth_soundfonts::FilterType,
+    base_cutoff: f32,
+    base_resonance_db: f32,
     loop_params: LoopParams,
     amp: f32,
     pan: f32,
@@ -43,6 +48,12 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     /// MOVE FORK: live `pan_oncc` bindings — fed to SIMDVoicePan which
     /// replaces the static SIMDConstantStereo pan stage.
     pan_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `cutoff_oncc` bindings — fed to
+    /// SIMDStereoVoiceCutoffLive which recomputes biquad coefficients
+    /// per `RECOMPUTE_INTERVAL`.
+    cutoff_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live `resonance_oncc` bindings.
+    resonance_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -66,6 +77,9 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         Self {
             speed_mult: params.speed_mult,
             filter,
+            filter_type: params.filter_type,
+            base_cutoff: params.cutoff.unwrap_or(22000.0),
+            base_resonance_db: params.base_resonance_db,
             loop_params: params.loop_params.clone(),
             amp,
             pan: params.pan,
@@ -77,6 +91,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             stream_params,
             volume_oncc: params.volume_oncc.clone(),
             pan_oncc: params.pan_oncc.clone(),
+            cutoff_oncc: params.cutoff_oncc.clone(),
+            resonance_oncc: params.resonance_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -226,7 +242,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let gen = self.apply_pan(gen, cc_state);
         let gen = self.apply_envelope(gen, control);
 
-        self.apply_cutoff_effect(gen)
+        self.apply_cutoff_effect(gen, cc_state)
     }
 
     /// MOVE FORK: live volume modulation via SFZ `volume_oncc<N>=<dB>`.
@@ -252,12 +268,28 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         VoiceCombineSIMD::mult(oncc, gen)
     }
 
+    /// MOVE FORK: cutoff stage uses SIMDStereoVoiceCutoffLive when a
+    /// filter is present. The Live variant always wraps the filter and
+    /// short-circuits coefficient recomputation when both `cutoff_oncc`
+    /// and `resonance_oncc` are empty — matching the prior static
+    /// SIMDStereoVoiceCutoff cost.
     fn apply_cutoff_effect(
         &self,
         gen: impl 'static + SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
+        cc_state: &CcState,
     ) -> Box<dyn Voice> {
         if let Some(filter) = &self.filter {
-            let gen = SIMDStereoVoiceCutoff::new(gen, filter);
+            let gen = SIMDStereoVoiceCutoffLive::new(
+                gen,
+                filter,
+                cc_state.clone(),
+                self.cutoff_oncc.clone(),
+                self.resonance_oncc.clone(),
+                self.filter_type,
+                self.stream_params.sample_rate as f32,
+                self.base_cutoff,
+                self.base_resonance_db,
+            );
             self.convert_to_voice(gen)
         } else {
             self.convert_to_voice(gen)

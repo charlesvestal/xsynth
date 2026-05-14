@@ -84,6 +84,12 @@ struct SampleVoiceSpawnerParams {
     speed_mult: f32,
     cutoff: Option<f32>,
     resonance: f32,
+    /// MOVE FORK: pre-Q base resonance in dB. Needed by live cutoff
+    /// modulation to recompute biquad coefficients from
+    /// `db_to_amp(base_db + Σ delta·cc/127) * Q_BUTTERWORTH_F32`.
+    /// `resonance` (above) is the already-converted Q value used at
+    /// filter construction.
+    base_resonance_db: f32,
     filter_type: FilterType,
     loop_params: LoopParams,
     envelope: Arc<EnvelopeParameters>,
@@ -458,6 +464,7 @@ impl SampleSoundfont {
                         speed_mult,
                         cutoff,
                         resonance: db_to_amp(region.resonance) * Q_BUTTERWORTH_F32,
+                        base_resonance_db: region.resonance,
                         filter_type: region.filter_type,
                         interpolator: options.interpolator,
                         loop_params,
@@ -638,6 +645,7 @@ impl SampleSoundfont {
                             speed_mult,
                             cutoff,
                             resonance: db_to_amp(note_params.resonance) * Q_BUTTERWORTH_F32,
+                            base_resonance_db: note_params.resonance,
                             filter_type: FilterType::LowPass,
                             interpolator: options.interpolator,
                             loop_params,

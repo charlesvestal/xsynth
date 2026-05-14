@@ -5,7 +5,7 @@ use simdeez::Simd;
 use crate::{
     effects::BiQuadFilter,
     voice::{
-        BufferSampler, SIMDMonoVoiceCutoff, SIMDSample, SIMDSampleGrabber, SIMDSampleMono,
+        BufferSampler, SIMDMonoVoiceCutoffLive, SIMDSample, SIMDSampleGrabber, SIMDSampleMono,
         SIMDVoiceGenerator,
     },
     AudioStreamParams,
@@ -27,6 +27,10 @@ use crate::soundfont::{Interpolator, LoopParams, SampleStorage, SampleVoiceSpawn
 pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     speed_mult: f32,
     filter: Option<BiQuadFilter>,
+    /// MOVE FORK: filter params kept for live cutoff modulation.
+    filter_type: xsynth_soundfonts::FilterType,
+    base_cutoff: f32,
+    base_resonance_db: f32,
     loop_params: LoopParams,
     amp: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
@@ -37,6 +41,9 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     stream_params: AudioStreamParams,
     /// MOVE FORK: see stereo.rs equivalent.
     volume_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: live cutoff/resonance oncc bindings.
+    cutoff_oncc: Arc<[(u8, f32)]>,
+    resonance_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -60,6 +67,9 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         Self {
             speed_mult: params.speed_mult,
             filter,
+            filter_type: params.filter_type,
+            base_cutoff: params.cutoff.unwrap_or(22000.0),
+            base_resonance_db: params.base_resonance_db,
             loop_params: params.loop_params.clone(),
             amp,
             volume_envelope_params: params.envelope.clone(),
@@ -69,6 +79,8 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             vel,
             stream_params,
             volume_oncc: params.volume_oncc.clone(),
+            cutoff_oncc: params.cutoff_oncc.clone(),
+            resonance_oncc: params.resonance_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -201,7 +213,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         let gen = self.apply_volume_oncc(gen, cc_state);
         let gen = self.apply_envelope(gen, control);
 
-        self.apply_cutoff_effect(gen)
+        self.apply_cutoff_effect(gen, cc_state)
     }
 
     /// MOVE FORK: see stereo.rs apply_volume_oncc for design notes.
@@ -222,9 +234,20 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
     fn apply_cutoff_effect(
         &self,
         gen: impl 'static + SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
+        cc_state: &CcState,
     ) -> Box<dyn Voice> {
         if let Some(filter) = &self.filter {
-            let gen = SIMDMonoVoiceCutoff::new(gen, filter);
+            let gen = SIMDMonoVoiceCutoffLive::new(
+                gen,
+                filter,
+                cc_state.clone(),
+                self.cutoff_oncc.clone(),
+                self.resonance_oncc.clone(),
+                self.filter_type,
+                self.stream_params.sample_rate as f32,
+                self.base_cutoff,
+                self.base_resonance_db,
+            );
             self.convert_to_voice(gen)
         } else {
             self.convert_to_voice(gen)

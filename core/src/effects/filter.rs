@@ -17,7 +17,7 @@ impl BiQuadFilter {
         }
     }
 
-    fn get_coeffs(
+    pub(crate) fn get_coeffs(
         fil_type: FilterType,
         freq: f32,
         sample_rate: f32,
