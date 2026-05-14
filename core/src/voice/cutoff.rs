@@ -17,10 +17,19 @@ use biquad::Q_BUTTERWORTH_F32;
 const RECOMPUTE_INTERVAL: u32 = 8;
 
 /// MOVE FORK: live filter state shared between mono/stereo cutoff
-/// modulators. Recomputes biquad coefficients from
-/// `base_freq * 2^(Σ cents·cc/127/1200)` and
-/// `db_to_amp(base_resonance_db + Σ db·cc/127) * Q_BUTTERWORTH_F32`
-/// on a counter, then sets them on the held filter(s).
+/// modulators.
+///
+/// On each tick (every `RECOMPUTE_INTERVAL` SIMD-vector calls = ~32
+/// audio samples at WIDTH=4):
+///   1. Compute target freq + Q from current CC state.
+///   2. One-pole-follow current freq + Q toward target with
+///      `alpha = 1 - exp(-tick_samples / smooth_samples)` ≈ 0.07
+///      (~10ms smoothing time constant at 44.1kHz).
+///   3. Re-derive biquad coefficients from the smoothed values.
+///
+/// Without the follower the filter coefficients jump 32 samples at a
+/// time, which is audibly zippery on knob sweeps. The exponential
+/// follower spreads each step across ~10ms of smoothing.
 struct LiveCutoffState {
     cc_state: CcState,
     cutoff_oncc: Arc<[(u8, f32)]>,
@@ -29,6 +38,13 @@ struct LiveCutoffState {
     sample_rate: f32,
     base_freq: f32,
     base_resonance_db: f32,
+    /// Smoothed current freq (Hz) — what the biquad coefficients
+    /// reflect this tick.
+    current_freq: f32,
+    /// Smoothed current Q.
+    current_q: f32,
+    /// Pre-computed one-pole alpha per tick.
+    smooth_alpha: f32,
     static_filter: bool,
     countdown: u32,
 }
@@ -44,6 +60,15 @@ impl LiveCutoffState {
         base_resonance_db: f32,
     ) -> Self {
         let static_filter = cutoff_oncc.is_empty() && resonance_oncc.is_empty();
+        // 10ms smoothing time constant. tick_samples = RECOMPUTE_INTERVAL
+        // * a SIMD vector width (assume 4 for aarch64 NEON; the exact
+        // value isn't critical — alpha just controls smoothing speed,
+        // any reasonable SIMD width gives a similar audible time
+        // constant).
+        let tick_samples = (RECOMPUTE_INTERVAL as f32) * 4.0;
+        let smooth_samples = sample_rate * 0.010;
+        let smooth_alpha = 1.0 - (-tick_samples / smooth_samples).exp();
+        let init_q = db_to_amp(base_resonance_db) * Q_BUTTERWORTH_F32;
         Self {
             cc_state,
             cutoff_oncc,
@@ -52,13 +77,17 @@ impl LiveCutoffState {
             sample_rate,
             base_freq,
             base_resonance_db,
+            current_freq: base_freq,
+            current_q: init_q,
+            smooth_alpha,
             static_filter,
             countdown: 0,
         }
     }
 
+    /// Target (freq, Q) from the live CC state.
     #[inline]
-    fn compute(&self) -> (f32, f32) {
+    fn target(&self) -> (f32, f32) {
         let mut cents_sum = 0.0_f32;
         for (cc, delta) in self.cutoff_oncc.iter() {
             let v = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
@@ -74,7 +103,19 @@ impl LiveCutoffState {
         (freq, q)
     }
 
-    /// Returns true iff coefficients should be updated this tick.
+    /// Advance one tick — sample target from CC, follow `current` toward
+    /// it. Returns the smoothed `(freq, q)` to feed into biquad coeffs.
+    #[inline(always)]
+    fn step(&mut self) -> (f32, f32) {
+        let (target_freq, target_q) = self.target();
+        self.current_freq += (target_freq - self.current_freq) * self.smooth_alpha;
+        self.current_q    += (target_q    - self.current_q)    * self.smooth_alpha;
+        (self.current_freq, self.current_q)
+    }
+
+    /// Returns true iff coefficients should be updated this tick. When
+    /// `true`, the caller MUST call `step()` to advance smoothing and
+    /// derive new freq/Q before recomputing biquad coefficients.
     #[inline(always)]
     fn tick(&mut self) -> bool {
         if self.static_filter {
@@ -283,7 +324,7 @@ where
     #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<S> {
         if self.state.tick() {
-            let (freq, q) = self.state.compute();
+            let (freq, q) = self.state.step();
             let coeffs = BiQuadFilter::get_coeffs(
                 self.state.fil_type, freq, self.state.sample_rate, Some(q),
             );
@@ -365,7 +406,7 @@ where
     #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleStereo<S> {
         if self.state.tick() {
-            let (freq, q) = self.state.compute();
+            let (freq, q) = self.state.step();
             let coeffs = BiQuadFilter::get_coeffs(
                 self.state.fil_type, freq, self.state.sample_rate, Some(q),
             );
