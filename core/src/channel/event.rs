@@ -51,6 +51,18 @@ pub enum ChannelConfigEvent {
     /// Controls whether the channel will be standard or percussion.
     /// Setting to `true` will make the channel only use percussion patches.
     SetPercussionMode(bool),
+
+    /// MOVE FORK / Phase 9 prototype: install a fundsp reverb on the
+    /// channel's post-mix bus. Pass `(room_size_seconds, time, damp)`
+    /// in fundsp `reverb_stereo` units. `None` removes any existing
+    /// reverb. Sample rate is configured on install.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    SetReverb(Option<(f32, f32, f32)>),
+
+    /// MOVE FORK / Phase 9 prototype: dry/wet mix for the channel
+    /// reverb (0 = dry, 1 = wet). Reverb processing is skipped
+    /// entirely when wet == 0.
+    SetReverbWet(f32),
 }
 
 /// MIDI events for a channel.

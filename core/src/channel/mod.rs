@@ -179,6 +179,13 @@ pub struct VoiceChannel {
 
     /// Effects
     cutoff: MultiChannelBiQuad,
+
+    /// MOVE FORK / Phase 9 prototype: fundsp reverb on the channel's
+    /// post-mix bus. `wet_send` is the dry/wet mix (0 = dry only,
+    /// 1 = wet only). Default 0 so existing presets sound identical
+    /// until something opts in. Updated via `SetChannelReverb`.
+    reverb: Option<Box<dyn fundsp::prelude::AudioUnit + Send>>,
+    reverb_wet: f32,
 }
 
 impl VoiceChannel {
@@ -230,7 +237,27 @@ impl VoiceChannel {
                 stream_params.sample_rate as f32,
                 None,
             ),
+            reverb: None,
+            reverb_wet: 0.0,
         }
+    }
+
+    /// MOVE FORK / Phase 9 prototype: install / replace a fundsp reverb
+    /// on this channel. Call with `None` to remove. `set_sample_rate`
+    /// is invoked on installation so the reverb runs at the output
+    /// rate.
+    pub fn set_reverb(&mut self, reverb: Option<Box<dyn fundsp::prelude::AudioUnit + Send>>) {
+        if let Some(mut r) = reverb {
+            r.set_sample_rate(self.stream_params.sample_rate as f64);
+            self.reverb = Some(r);
+        } else {
+            self.reverb = None;
+        }
+    }
+
+    /// MOVE FORK / Phase 9 prototype: set the dry/wet mix (0..1).
+    pub fn set_reverb_wet(&mut self, wet: f32) {
+        self.reverb_wet = wet.clamp(0.0, 1.0);
     }
 
     fn apply_channel_effects(&mut self, out: &mut [f32]) {
@@ -268,6 +295,26 @@ impl VoiceChannel {
             self.cutoff
                 .set_filter_type(FilterType::LowPass, cutoff, control.resonance);
             self.cutoff.process(out);
+        }
+
+        // MOVE FORK / Phase 9 prototype: stereo reverb send. Skipped
+        // entirely when `reverb_wet == 0` so dry presets pay zero
+        // cost (the common case until users opt in). When active,
+        // tick the AudioUnit per stereo frame and mix in.
+        if self.reverb_wet > 0.0 {
+            if let Some(reverb) = self.reverb.as_mut() {
+                let dry_gain = 1.0 - self.reverb_wet;
+                let wet_gain = self.reverb_wet;
+                if let ChannelCount::Stereo = self.stream_params.channels {
+                    for sample in out.chunks_mut(2) {
+                        let input = [sample[0], sample[1]];
+                        let mut output = [0.0f32; 2];
+                        reverb.tick(&input, &mut output);
+                        sample[0] = sample[0] * dry_gain + output[0] * wet_gain;
+                        sample[1] = sample[1] * dry_gain + output[1] * wet_gain;
+                    }
+                }
+            }
         }
     }
 
@@ -482,7 +529,32 @@ impl VoiceChannel {
                         self.reset_program();
                     }
                 },
-                ChannelEvent::Config(config) => self.params.process_config_event(config),
+                ChannelEvent::Config(config) => {
+                    // MOVE FORK / Phase 9 prototype: reverb config lives
+                    // on VoiceChannel (post-mix state), not on
+                    // VoiceChannelParams (voice-spawn config). Intercept
+                    // here.
+                    match config {
+                        ChannelConfigEvent::SetReverb(params) => {
+                            if let Some((room, time, damp)) = params {
+                                let mut unit: Box<dyn fundsp::prelude::AudioUnit + Send> =
+                                    Box::new(fundsp::hacker32::reverb_stereo(
+                                        room, time, damp,
+                                    ));
+                                unit.set_sample_rate(
+                                    self.stream_params.sample_rate as f64,
+                                );
+                                self.reverb = Some(unit);
+                            } else {
+                                self.reverb = None;
+                            }
+                        }
+                        ChannelConfigEvent::SetReverbWet(wet) => {
+                            self.reverb_wet = wet.clamp(0.0, 1.0);
+                        }
+                        other => self.params.process_config_event(other),
+                    }
+                }
             }
         }
     }
@@ -514,6 +586,13 @@ impl VoiceChannel {
             if !key.event_cache.is_empty() {
                 return true;
             }
+        }
+        // MOVE FORK / Phase 9 prototype: keep rendering while the
+        // post-mix reverb is wet so its tail isn't truncated when the
+        // last voice ends. Costs ~800 µs/block on idle channels, but
+        // only when the user opts into reverb (default wet = 0).
+        if self.reverb_wet > 0.0 && self.reverb.is_some() {
+            return true;
         }
         false
     }

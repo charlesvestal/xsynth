@@ -86,6 +86,11 @@ impl VoiceChannelParams {
                 }
                 self.channel_sf.change_program(self.program);
             }
+            // MOVE FORK / Phase 9: reverb events are intercepted by
+            // VoiceChannel before reaching here. If one slips through
+            // (e.g. via a different code path), treat as no-op.
+            ChannelConfigEvent::SetReverb(_)
+            | ChannelConfigEvent::SetReverbWet(_) => {}
         }
     }
 
