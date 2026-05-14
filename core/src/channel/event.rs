@@ -63,6 +63,22 @@ pub enum ChannelConfigEvent {
     /// reverb (0 = dry, 1 = wet). Reverb processing is skipped
     /// entirely when wet == 0.
     SetReverbWet(f32),
+
+    /// MOVE FORK / Phase 9: install/remove the hand-rolled stereo
+    /// feedback delay on the channel post-mix. `Some((time, fb))` =
+    /// install with delay time in seconds and feedback amount 0..0.95.
+    /// `None` removes (drops the ring buffer).
+    SetDelay(Option<(f32, f32)>),
+
+    /// MOVE FORK / Phase 9: live delay time update (seconds, clamped
+    /// to 0..2). No-op when no delay is installed.
+    SetDelayTime(f32),
+
+    /// MOVE FORK / Phase 9: live feedback update (0..0.95).
+    SetDelayFeedback(f32),
+
+    /// MOVE FORK / Phase 9: dry/wet mix (0..1). Zero skips processing.
+    SetDelayMix(f32),
 }
 
 /// MIDI events for a channel.

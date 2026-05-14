@@ -186,6 +186,11 @@ pub struct VoiceChannel {
     /// until something opts in. Updated via `SetChannelReverb`.
     reverb: Option<Box<dyn fundsp::prelude::AudioUnit + Send>>,
     reverb_wet: f32,
+    /// MOVE FORK / Phase 9: hand-rolled stereo feedback delay. Only
+    /// allocated when SetDelay enables it (preset has `<effect type=
+    /// "delay">`). `delay_mix` 0..1 — zero skips processing entirely.
+    delay: Option<crate::effects::StereoFeedbackDelay>,
+    delay_mix: f32,
 }
 
 impl VoiceChannel {
@@ -239,6 +244,8 @@ impl VoiceChannel {
             ),
             reverb: None,
             reverb_wet: 0.0,
+            delay: None,
+            delay_mix: 0.0,
         }
     }
 
@@ -312,6 +319,26 @@ impl VoiceChannel {
                         reverb.tick(&input, &mut output);
                         sample[0] = sample[0] * dry_gain + output[0] * wet_gain;
                         sample[1] = sample[1] * dry_gain + output[1] * wet_gain;
+                    }
+                }
+            }
+        }
+
+        // MOVE FORK / Phase 9: stereo feedback delay. Same dry/wet
+        // mix discipline as reverb — zero mix skips entirely. The
+        // delay always feeds back its own line at the configured
+        // feedback level; that ring is preserved across `mix=0`
+        // disable so re-enabling resumes the tail rather than
+        // restarting.
+        if self.delay_mix > 0.0 {
+            if let Some(delay) = self.delay.as_mut() {
+                let dry_gain = 1.0 - self.delay_mix;
+                let wet_gain = self.delay_mix;
+                if let ChannelCount::Stereo = self.stream_params.channels {
+                    for sample in out.chunks_mut(2) {
+                        let (wl, wr) = delay.process(sample[0], sample[1]);
+                        sample[0] = sample[0] * dry_gain + wl * wet_gain;
+                        sample[1] = sample[1] * dry_gain + wr * wet_gain;
                     }
                 }
             }
@@ -552,6 +579,31 @@ impl VoiceChannel {
                         ChannelConfigEvent::SetReverbWet(wet) => {
                             self.reverb_wet = wet.clamp(0.0, 1.0);
                         }
+                        ChannelConfigEvent::SetDelay(params) => {
+                            if let Some((time, fb)) = params {
+                                let mut d = crate::effects::StereoFeedbackDelay::new(
+                                    self.stream_params.sample_rate as f32,
+                                );
+                                d.set_time(time);
+                                d.set_feedback(fb);
+                                self.delay = Some(d);
+                            } else {
+                                self.delay = None;
+                            }
+                        }
+                        ChannelConfigEvent::SetDelayTime(t) => {
+                            if let Some(d) = self.delay.as_mut() {
+                                d.set_time(t);
+                            }
+                        }
+                        ChannelConfigEvent::SetDelayFeedback(fb) => {
+                            if let Some(d) = self.delay.as_mut() {
+                                d.set_feedback(fb);
+                            }
+                        }
+                        ChannelConfigEvent::SetDelayMix(m) => {
+                            self.delay_mix = m.clamp(0.0, 1.0);
+                        }
                         other => self.params.process_config_event(other),
                     }
                 }
@@ -592,6 +644,10 @@ impl VoiceChannel {
         // last voice ends. Costs ~800 µs/block on idle channels, but
         // only when the user opts into reverb (default wet = 0).
         if self.reverb_wet > 0.0 && self.reverb.is_some() {
+            return true;
+        }
+        // Same for delay — drain the feedback tail after the last note.
+        if self.delay_mix > 0.0 && self.delay.is_some() {
             return true;
         }
         false
