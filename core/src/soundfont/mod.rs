@@ -76,6 +76,9 @@ pub(super) struct LoopParams {
     pub start: u32,
     pub end: u32,
     pub stop: Option<u32>,
+    /// MOVE FORK / Phase 8: crossfade duration in audio frames.
+    /// Zero = no crossfade (legacy behavior — abrupt loop wrap).
+    pub crossfade: u32,
 }
 
 struct SampleVoiceSpawnerParams {
@@ -464,6 +467,12 @@ impl SampleSoundfont {
                             stream_params.sample_rate,
                         ),
                         stop: None,
+                        // MOVE FORK / Phase 8: SFZ `loop_crossfade` is
+                        // in seconds — multiply by output rate, not the
+                        // source rate, since the sampler indexes into
+                        // the resampled stream.
+                        crossfade: (region.loop_crossfade
+                            * stream_params.sample_rate as f32) as u32,
                     };
 
                     let mut region_samples = samples[&params].0.clone();
@@ -641,6 +650,7 @@ impl SampleSoundfont {
                             start: region.loop_start,
                             end: region.loop_end,
                             stop: Some(region.sample_end),
+                            crossfade: 0, // SF2 has no loop_crossfade
                         };
 
                         let mut region_samples: Arc<[Arc<[i16]>]> = region.sample.clone();

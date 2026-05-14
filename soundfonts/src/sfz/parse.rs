@@ -31,6 +31,12 @@ pub enum SfzOpcode {
     LoopMode(LoopMode),
     LoopStart(u32),
     LoopEnd(u32),
+    /// MOVE FORK / Phase 8: SFZ `loop_crossfade=<seconds>` — fade
+    /// duration in seconds applied across the loop point so the
+    /// transition from `loop_end` back to `loop_start` is smooth.
+    /// Stored on the region as raw f32 seconds; converted to frame
+    /// count at voice spawn (rate * seconds).
+    LoopCrossfade(f32),
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
@@ -481,6 +487,7 @@ fn parse_sfz_opcode(
         "loop_mode" | "loopmode" => parse_loop_mode(val).map(LoopMode),
         "loop_start" | "loopstart" => parse_u32_in_range(val, 0..=u32::MAX).map(LoopStart),
         "loop_end" | "loopend" => parse_u32_in_range(val, 0..=u32::MAX).map(LoopEnd),
+        "loop_crossfade" | "loopcrossfade" => val.parse::<f32>().ok().map(LoopCrossfade),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),

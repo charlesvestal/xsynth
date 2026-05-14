@@ -141,15 +141,24 @@ pub struct SampleReaderLoop<Sampler: BufferSampler> {
     offset: usize,
     loop_start: usize,
     loop_end: usize,
+    /// MOVE FORK / Phase 8: SFZ `loop_crossfade` in audio frames. The
+    /// last N samples before `loop_end` blend with the pre-`loop_start`
+    /// equivalent so the loop boundary is seamless. Zero disables.
+    crossfade: usize,
 }
 
 impl<Sampler: BufferSampler> SampleReaderLoop<Sampler> {
     pub fn new(buffer: Sampler, loop_params: LoopParams) -> Self {
+        // Clamp crossfade to the loop region length so it never reads
+        // outside the buffer.
+        let region = loop_params.end.saturating_sub(loop_params.start) as usize;
+        let crossfade = (loop_params.crossfade as usize).min(region);
         Self {
             buffer,
             offset: loop_params.offset as usize,
             loop_start: loop_params.start as usize,
             loop_end: loop_params.end as usize,
+            crossfade,
         }
     }
 }
@@ -164,6 +173,25 @@ impl<Sampler: BufferSampler> SampleReader for SampleReaderLoop<Sampler> {
             pos = (pos - end - 1) % (end - start) + start;
         }
 
+        // MOVE FORK / Phase 8: linear crossfade across the last N
+        // frames of the loop. At `pos == end - xfade`, alpha = 0 (pure
+        // late-loop sample); at `pos == end`, alpha = 1 (pure
+        // pre-start sample). The pre-start sample at `pos - (end -
+        // start)` is what the audio would naturally pick up just past
+        // the loop wrap, so blending into it smooths the discontinuity.
+        if self.crossfade > 0 && end > self.crossfade && pos > end - self.crossfade {
+            let into_xfade = pos - (end - self.crossfade);
+            let alpha = into_xfade as f32 / self.crossfade as f32;
+            let region = end - start;
+            let primary = self.buffer.get(pos);
+            // Underflow guard: only blend when the pre-start sample
+            // exists in the buffer.
+            if pos > region {
+                let pre = self.buffer.get(pos - region);
+                return primary * (1.0 - alpha) + pre * alpha;
+            }
+            return primary;
+        }
         self.buffer.get(pos)
     }
 
@@ -180,6 +208,8 @@ pub struct SampleReaderLoopSustain<Sampler: BufferSampler> {
     offset: usize,
     loop_start: usize,
     loop_end: usize,
+    /// MOVE FORK / Phase 8: see SampleReaderLoop.
+    crossfade: usize,
     last: usize,
     is_released: bool,
 }
@@ -191,12 +221,15 @@ impl<Sampler: BufferSampler> SampleReaderLoopSustain<Sampler> {
             .map(|stop| stop as usize)
             .unwrap_or_else(|| buffer.length());
         let length = Some(stop);
+        let region = loop_params.end.saturating_sub(loop_params.start) as usize;
+        let crossfade = (loop_params.crossfade as usize).min(region);
         Self {
             buffer,
             length,
             offset: loop_params.offset as usize,
             loop_start: loop_params.start as usize,
             loop_end: loop_params.end as usize,
+            crossfade,
             last: 0,
             is_released: false,
         }
@@ -213,6 +246,20 @@ impl<Sampler: BufferSampler> SampleReader for SampleReaderLoopSustain<Sampler> {
             self.last = pos;
             if pos > end {
                 pos = (pos - end - 1) % (end - start) + start;
+            }
+            // MOVE FORK / Phase 8: crossfade across loop boundary.
+            // Skipped while released (the sample plays linearly past
+            // the loop point so the natural decay is preserved).
+            if self.crossfade > 0 && end > self.crossfade && pos > end - self.crossfade {
+                let into_xfade = pos - (end - self.crossfade);
+                let alpha = into_xfade as f32 / self.crossfade as f32;
+                let region = end - start;
+                let primary = self.buffer.get(pos);
+                if pos > region {
+                    let pre = self.buffer.get(pos - region);
+                    return primary * (1.0 - alpha) + pre * alpha;
+                }
+                return primary;
             }
         } else {
             pos = pos - self.last + self.loop_end;
