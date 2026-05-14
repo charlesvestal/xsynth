@@ -344,19 +344,6 @@ impl VoiceBuffer {
         self.buffer.len()
     }
 
-    /// MOVE FORK: per-state voice counts for diagnostics. Returns
-    /// `(total, releasing, killed)` — voices may be in both states
-    /// (signal_release after Kill). Killed implies count overlap.
-    pub fn voice_state_counts(&self) -> (usize, usize, usize) {
-        let mut releasing = 0;
-        let mut killed = 0;
-        for v in self.buffer.iter() {
-            if v.is_releasing() { releasing += 1; }
-            if v.is_killed() { killed += 1; }
-        }
-        (self.buffer.len(), releasing, killed)
-    }
-
     pub fn set_damper(&mut self, damper: bool) {
         if self.damper_held && !damper {
             // Release all voices that are held by the damper
