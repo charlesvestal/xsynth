@@ -25,6 +25,8 @@ const RECOMPUTE_INTERVAL: u32 = 8;
 pub struct SIMDVoicePan<S: Simd> {
     cc_state: CcState,
     bindings: Arc<[(u8, f32)]>,
+    curvecc: Arc<[(u8, u8)]>,
+    curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
     /// Base pan in [-1, 1]. Per-CC deltas are in *percent* (SFZ
     /// pan_oncc is -100..100), converted to [-1, 1] when added.
     base_pan: f32,
@@ -35,18 +37,26 @@ pub struct SIMDVoicePan<S: Simd> {
 }
 
 impl<S: Simd> SIMDVoicePan<S> {
-    pub fn new(cc_state: CcState, bindings: Arc<[(u8, f32)]>, base_pan: f32) -> Self {
+    pub fn new(
+        cc_state: CcState,
+        bindings: Arc<[(u8, f32)]>,
+        curvecc: Arc<[(u8, u8)]>,
+        curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+        base_pan: f32,
+    ) -> Self {
         let static_pan = bindings.is_empty();
         let pan = if static_pan {
             base_pan
         } else {
-            compute_pan(&cc_state, &bindings, base_pan)
+            compute_pan(&cc_state, &bindings, &curvecc, &curves, base_pan)
         };
         let (l, r) = gains(pan);
         simd_invoke!(S, {
             SIMDVoicePan {
                 cc_state,
                 bindings,
+                curvecc,
+                curves,
                 base_pan,
                 left_gain: S::Vf32::set1(l),
                 right_gain: S::Vf32::set1(r),
@@ -58,11 +68,32 @@ impl<S: Simd> SIMDVoicePan<S> {
 }
 
 #[inline]
-fn compute_pan(cc_state: &CcState, bindings: &[(u8, f32)], base_pan: f32) -> f32 {
+fn cc_lookup(
+    cc_val: u8,
+    cc: u8,
+    curvecc: &[(u8, u8)],
+    curves: &std::collections::HashMap<u8, [f32; 128]>,
+) -> f32 {
+    if let Some((_, id)) = curvecc.iter().find(|(c, _)| *c == cc) {
+        if let Some(table) = curves.get(id) {
+            return table[cc_val as usize];
+        }
+    }
+    cc_val as f32 / 127.0
+}
+
+#[inline]
+fn compute_pan(
+    cc_state: &CcState,
+    bindings: &[(u8, f32)],
+    curvecc: &[(u8, u8)],
+    curves: &std::collections::HashMap<u8, [f32; 128]>,
+    base_pan: f32,
+) -> f32 {
     let mut pan = base_pan;
     for (cc, delta_pct) in bindings.iter() {
-        let v = cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
-        pan += (*delta_pct * v) / 100.0;
+        let cc_val = cc_state[*cc as usize].load(Ordering::Relaxed);
+        pan += (*delta_pct * cc_lookup(cc_val, *cc, curvecc, curves)) / 100.0;
     }
     pan.clamp(-1.0, 1.0)
 }
@@ -93,7 +124,13 @@ impl<S: Simd> SIMDVoiceGenerator<S, SIMDSampleStereo<S>> for SIMDVoicePan<S> {
     fn next_sample(&mut self) -> SIMDSampleStereo<S> {
         if !self.static_pan {
             if self.countdown == 0 {
-                let pan = compute_pan(&self.cc_state, &self.bindings, self.base_pan);
+                let pan = compute_pan(
+                    &self.cc_state,
+                    &self.bindings,
+                    &self.curvecc,
+                    &self.curves,
+                    self.base_pan,
+                );
                 let (l, r) = gains(pan);
                 simd_invoke!(S, {
                     self.left_gain = S::Vf32::set1(l);

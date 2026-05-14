@@ -91,6 +91,21 @@ pub enum SfzOpcode {
     /// MOVE FORK: `pan_oncc<N>=<percent>` — live pan modulation. Pan
     /// offset (-100..100) added to the base pan at CC=N.
     PanOncc(u8, f32),
+    /// MOVE FORK: `<base>_curvecc<N>=<curve_id>` — references a curve
+    /// table that shapes the CC lookup for this binding. Base is one of
+    /// volume/cutoff/resonance/pan; the matching `_oncc<N>` opcode
+    /// provides the full-swing magnitude. SIMD generators use
+    /// `curve[cc]` instead of `cc/127` when a curve is referenced.
+    VolumeCurvecc(u8, u8),
+    CutoffCurvecc(u8, u8),
+    ResonanceCurvecc(u8, u8),
+    PanCurvecc(u8, u8),
+    /// MOVE FORK: `index=<id>` inside a `<curve>` block. Identifies the
+    /// curve table being defined.
+    CurveIndex(u8),
+    /// MOVE FORK: `v<NNN>=<f32>` inside a `<curve>` block. NNN is
+    /// 0..127. Defines one sample point of the current curve.
+    CurvePoint(u8, f32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +139,12 @@ pub enum SfzGroupType {
     Master,
     Global,
     Control,
+    /// MOVE FORK: SFZv2 `<curve>` block — defines a 128-point curve
+    /// referenced by `<base>_curvecc<N>=<curve_id>` opcodes. Curve
+    /// shapes the `cc/127` lookup that `_oncc` modulators apply.
+    /// The block body uses `index=<id>` plus `vNNN=<value>` opcodes
+    /// (0..127) to define the table.
+    Curve,
     Other,
 }
 
@@ -397,9 +418,43 @@ fn parse_sfz_opcode(
         // unrecognized _oncc: silently drop
         return Ok(None);
     }
-    // Same for `_curvecc<N>` — silently drop (no curve support yet).
-    if name.contains("_curvecc") || name.contains("_curve_cc") {
+    // MOVE FORK: `<base>_curvecc<N>=<curve_id>` for volume/cutoff/
+    // resonance/pan bases. The matching `_oncc<N>` provides the
+    // full-swing magnitude; the curve shapes the CC lookup.
+    if let Some(idx) = name.find("_curvecc") {
+        let base_name = &name[..idx];
+        let cc_part = &name[idx + "_curvecc".len()..];
+        if let Ok(cc_n) = cc_part.parse::<u8>() {
+            if let Ok(curve_id) = val.parse::<u8>() {
+                match base_name {
+                    "volume" => return Ok(Some(VolumeCurvecc(cc_n, curve_id))),
+                    "cutoff" => return Ok(Some(CutoffCurvecc(cc_n, curve_id))),
+                    "resonance" => return Ok(Some(ResonanceCurvecc(cc_n, curve_id))),
+                    "pan" => return Ok(Some(PanCurvecc(cc_n, curve_id))),
+                    _ => return Ok(None),
+                }
+            }
+        }
         return Ok(None);
+    }
+    // MOVE FORK: <curve> block opcodes.
+    if name == "index" {
+        if let Ok(id) = val.parse::<u8>() {
+            return Ok(Some(CurveIndex(id)));
+        }
+        return Ok(None);
+    }
+    if name.len() >= 2 && name.starts_with('v') {
+        let nstr = &name[1..];
+        if nstr.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = nstr.parse::<u8>() {
+                if n <= 127 {
+                    if let Ok(v) = val.parse::<f32>() {
+                        return Ok(Some(CurvePoint(n, v)));
+                    }
+                }
+            }
+        }
     }
 
     Ok(match name {
@@ -471,6 +526,7 @@ fn parse_sfz_group(group: Group) -> Result<SfzGroupType, SfzValidationError> {
         "master" => SfzGroupType::Master,
         "global" => SfzGroupType::Global,
         "control" => SfzGroupType::Control,
+        "curve" => SfzGroupType::Curve,
         _ => SfzGroupType::Other,
     })
 }

@@ -54,6 +54,13 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     cutoff_oncc: Arc<[(u8, f32)]>,
     /// MOVE FORK: live `resonance_oncc` bindings.
     resonance_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK / Phase 6: per-CC curve_id for each `_oncc` family.
+    volume_curvecc: Arc<[(u8, u8)]>,
+    pan_curvecc: Arc<[(u8, u8)]>,
+    cutoff_curvecc: Arc<[(u8, u8)]>,
+    resonance_curvecc: Arc<[(u8, u8)]>,
+    /// MOVE FORK / Phase 6: shared curve table map.
+    curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
     _s: PhantomData<S>,
 }
 
@@ -93,6 +100,11 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             pan_oncc: params.pan_oncc.clone(),
             cutoff_oncc: params.cutoff_oncc.clone(),
             resonance_oncc: params.resonance_oncc.clone(),
+            volume_curvecc: params.volume_curvecc.clone(),
+            pan_curvecc: params.pan_curvecc.clone(),
+            cutoff_curvecc: params.cutoff_curvecc.clone(),
+            resonance_curvecc: params.resonance_curvecc.clone(),
+            curves: params.curves.clone(),
             _s: PhantomData,
         }
     }
@@ -175,7 +187,13 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         SIMDSampleStereo<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
-        let pan_gen = SIMDVoicePan::<S>::new(cc_state.clone(), self.pan_oncc.clone(), self.pan);
+        let pan_gen = SIMDVoicePan::<S>::new(
+            cc_state.clone(),
+            self.pan_oncc.clone(),
+            self.pan_curvecc.clone(),
+            self.curves.clone(),
+            self.pan,
+        );
         VoiceCombineSIMD::mult(pan_gen, gen)
     }
 
@@ -264,7 +282,12 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
-        let oncc = SIMDVoiceOnccAmp::<S>::new(cc_state.clone(), self.volume_oncc.clone());
+        let oncc = SIMDVoiceOnccAmp::<S>::new(
+            cc_state.clone(),
+            self.volume_oncc.clone(),
+            self.volume_curvecc.clone(),
+            self.curves.clone(),
+        );
         VoiceCombineSIMD::mult(oncc, gen)
     }
 
@@ -285,6 +308,9 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
                 cc_state.clone(),
                 self.cutoff_oncc.clone(),
                 self.resonance_oncc.clone(),
+                self.cutoff_curvecc.clone(),
+                self.resonance_curvecc.clone(),
+                self.curves.clone(),
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,

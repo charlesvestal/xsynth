@@ -16,6 +16,22 @@ use biquad::Q_BUTTERWORTH_F32;
 /// MOVE FORK: see oncc_amp.rs / pan_oncc.rs for cadence rationale.
 const RECOMPUTE_INTERVAL: u32 = 8;
 
+/// MOVE FORK / Phase 6: resolve CC value through optional curve.
+#[inline]
+fn cc_lookup(
+    cc_val: u8,
+    cc: u8,
+    curvecc: &[(u8, u8)],
+    curves: &std::collections::HashMap<u8, [f32; 128]>,
+) -> f32 {
+    if let Some((_, id)) = curvecc.iter().find(|(c, _)| *c == cc) {
+        if let Some(table) = curves.get(id) {
+            return table[cc_val as usize];
+        }
+    }
+    cc_val as f32 / 127.0
+}
+
 /// MOVE FORK: live filter state shared between mono/stereo cutoff
 /// modulators.
 ///
@@ -34,6 +50,9 @@ struct LiveCutoffState {
     cc_state: CcState,
     cutoff_oncc: Arc<[(u8, f32)]>,
     resonance_oncc: Arc<[(u8, f32)]>,
+    cutoff_curvecc: Arc<[(u8, u8)]>,
+    resonance_curvecc: Arc<[(u8, u8)]>,
+    curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
     fil_type: FilterType,
     sample_rate: f32,
     base_freq: f32,
@@ -54,6 +73,9 @@ impl LiveCutoffState {
         cc_state: CcState,
         cutoff_oncc: Arc<[(u8, f32)]>,
         resonance_oncc: Arc<[(u8, f32)]>,
+        cutoff_curvecc: Arc<[(u8, u8)]>,
+        resonance_curvecc: Arc<[(u8, u8)]>,
+        curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -73,6 +95,9 @@ impl LiveCutoffState {
             cc_state,
             cutoff_oncc,
             resonance_oncc,
+            cutoff_curvecc,
+            resonance_curvecc,
+            curves,
             fil_type,
             sample_rate,
             base_freq,
@@ -90,13 +115,13 @@ impl LiveCutoffState {
     fn target(&self) -> (f32, f32) {
         let mut cents_sum = 0.0_f32;
         for (cc, delta) in self.cutoff_oncc.iter() {
-            let v = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
-            cents_sum += delta * v;
+            let cc_val = self.cc_state[*cc as usize].load(Ordering::Relaxed);
+            cents_sum += delta * cc_lookup(cc_val, *cc, &self.cutoff_curvecc, &self.curves);
         }
         let mut db_sum = self.base_resonance_db;
         for (cc, delta) in self.resonance_oncc.iter() {
-            let v = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
-            db_sum += delta * v;
+            let cc_val = self.cc_state[*cc as usize].load(Ordering::Relaxed);
+            db_sum += delta * cc_lookup(cc_val, *cc, &self.resonance_curvecc, &self.curves);
         }
         let freq = self.base_freq * (cents_sum / 1200.0).exp2();
         let q = db_to_amp(db_sum) * Q_BUTTERWORTH_F32;
@@ -281,6 +306,9 @@ where
         cc_state: CcState,
         cutoff_oncc: Arc<[(u8, f32)]>,
         resonance_oncc: Arc<[(u8, f32)]>,
+        cutoff_curvecc: Arc<[(u8, u8)]>,
+        resonance_curvecc: Arc<[(u8, u8)]>,
+        curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -293,6 +321,9 @@ where
                 cc_state,
                 cutoff_oncc,
                 resonance_oncc,
+                cutoff_curvecc,
+                resonance_curvecc,
+                curves,
                 fil_type,
                 sample_rate,
                 base_freq,
@@ -362,6 +393,9 @@ where
         cc_state: CcState,
         cutoff_oncc: Arc<[(u8, f32)]>,
         resonance_oncc: Arc<[(u8, f32)]>,
+        cutoff_curvecc: Arc<[(u8, u8)]>,
+        resonance_curvecc: Arc<[(u8, u8)]>,
+        curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -375,6 +409,9 @@ where
                 cc_state,
                 cutoff_oncc,
                 resonance_oncc,
+                cutoff_curvecc,
+                resonance_curvecc,
+                curves,
                 fil_type,
                 sample_rate,
                 base_freq,

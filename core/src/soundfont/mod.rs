@@ -114,6 +114,16 @@ struct SampleVoiceSpawnerParams {
     resonance_oncc: Arc<[(u8, f32)]>,
     /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings from the region.
     pan_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK: Phase 6 curvecc bindings: per-CC (cc, curve_id) for
+    /// each `_oncc` family. SIMD generators consult `curves[id][cc_val]`
+    /// when a CC has a matching curvecc, else fall back to cc_val/127.
+    volume_curvecc: Arc<[(u8, u8)]>,
+    cutoff_curvecc: Arc<[(u8, u8)]>,
+    resonance_curvecc: Arc<[(u8, u8)]>,
+    pan_curvecc: Arc<[(u8, u8)]>,
+    /// MOVE FORK: Phase 6 curve tables shared across regions. Empty
+    /// HashMap when the SFZ has no `<curve>` blocks.
+    curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -371,6 +381,11 @@ impl SampleSoundfont {
             let cutoff_oncc: Arc<[(u8, f32)]> = region.cutoff_oncc.clone().into();
             let resonance_oncc: Arc<[(u8, f32)]> = region.resonance_oncc.clone().into();
             let pan_oncc: Arc<[(u8, f32)]> = region.pan_oncc.clone().into();
+            let volume_curvecc: Arc<[(u8, u8)]> = region.volume_curvecc.clone().into();
+            let cutoff_curvecc: Arc<[(u8, u8)]> = region.cutoff_curvecc.clone().into();
+            let resonance_curvecc: Arc<[(u8, u8)]> = region.resonance_curvecc.clone().into();
+            let pan_curvecc: Arc<[(u8, u8)]> = region.pan_curvecc.clone().into();
+            let curves = region.curves.clone();
 
             for key in region.keyrange.clone() {
                 for vel in region.velrange.clone() {
@@ -475,6 +490,11 @@ impl SampleSoundfont {
                         cutoff_oncc: cutoff_oncc.clone(),
                         resonance_oncc: resonance_oncc.clone(),
                         pan_oncc: pan_oncc.clone(),
+                        volume_curvecc: volume_curvecc.clone(),
+                        cutoff_curvecc: cutoff_curvecc.clone(),
+                        resonance_curvecc: resonance_curvecc.clone(),
+                        pan_curvecc: pan_curvecc.clone(),
+                        curves: curves.clone(),
                     });
 
                     // MOVE FORK: track max seq_length seen at this slot
@@ -657,6 +677,11 @@ impl SampleSoundfont {
                             cutoff_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                             resonance_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                             pan_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            volume_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
+                            cutoff_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
+                            resonance_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
+                            pan_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
+                            curves: Arc::new(std::collections::HashMap::new()),
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());

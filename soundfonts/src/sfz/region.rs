@@ -5,6 +5,7 @@ use std::{
 };
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{FilterType, LoopMode};
 
@@ -121,6 +122,13 @@ pub(crate) struct RegionParamsBuilder {
     resonance_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
     pan_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: Phase 6 `_curvecc<N>=<curve_id>` bindings. Each entry
+    /// (CC number, curve id) shapes the matching `_oncc<N>` modulation
+    /// via curve[cc_value] ∈ [0, 1] instead of raw cc/127.
+    volume_curvecc: Vec<(u8, u8)>,
+    cutoff_curvecc: Vec<(u8, u8)>,
+    resonance_curvecc: Vec<(u8, u8)>,
+    pan_curvecc: Vec<(u8, u8)>,
 }
 
 impl Default for RegionParamsBuilder {
@@ -161,6 +169,10 @@ impl Default for RegionParamsBuilder {
             cutoff_oncc: Vec::new(),
             resonance_oncc: Vec::new(),
             pan_oncc: Vec::new(),
+            volume_curvecc: Vec::new(),
+            cutoff_curvecc: Vec::new(),
+            resonance_curvecc: Vec::new(),
+            pan_curvecc: Vec::new(),
         }
     }
 }
@@ -243,11 +255,45 @@ impl RegionParamsBuilder {
                     self.pan_oncc.push((cc, pct));
                 }
             }
+            // MOVE FORK: Phase 6 curvecc — attach curve_id to the binding
+            // for the matching CC. Last-assignment-wins like _oncc.
+            SfzOpcode::VolumeCurvecc(cc, id) => {
+                if let Some(existing) = self.volume_curvecc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = id;
+                } else {
+                    self.volume_curvecc.push((cc, id));
+                }
+            }
+            SfzOpcode::CutoffCurvecc(cc, id) => {
+                if let Some(existing) = self.cutoff_curvecc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = id;
+                } else {
+                    self.cutoff_curvecc.push((cc, id));
+                }
+            }
+            SfzOpcode::ResonanceCurvecc(cc, id) => {
+                if let Some(existing) = self.resonance_curvecc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = id;
+                } else {
+                    self.resonance_curvecc.push((cc, id));
+                }
+            }
+            SfzOpcode::PanCurvecc(cc, id) => {
+                if let Some(existing) = self.pan_curvecc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = id;
+                } else {
+                    self.pan_curvecc.push((cc, id));
+                }
+            }
             // MOVE FORK: ARIA opcodes are resolved in parse_sf_root, not
             // here. If one reaches update_from_flag it means the parent
             // didn't intercept it — treat as no-op so the match stays
             // exhaustive.
             SfzOpcode::AriaCcInit(_, _) | SfzOpcode::AriaOncc { .. } => {}
+            // <curve> block opcodes are routed into a CurveBuilder by
+            // parse_sf_root, not into RegionParamsBuilder. Reach here
+            // → silently no-op.
+            SfzOpcode::CurveIndex(_) | SfzOpcode::CurvePoint(_, _) => {}
         }
     }
 
@@ -255,6 +301,7 @@ impl RegionParamsBuilder {
         self,
         base_path: &Path,
         cc_state: &HashMap<u8, f32>,
+        curves: Arc<HashMap<u8, [f32; 128]>>,
     ) -> Option<RegionParams> {
         // MOVE FORK: evaluate locc/hicc against static CC state. Regions
         // whose CC constraints aren't satisfied at default load-time CC
@@ -317,6 +364,11 @@ impl RegionParamsBuilder {
             cutoff_oncc: self.cutoff_oncc,
             resonance_oncc: self.resonance_oncc,
             pan_oncc: self.pan_oncc,
+            volume_curvecc: self.volume_curvecc,
+            cutoff_curvecc: self.cutoff_curvecc,
+            resonance_curvecc: self.resonance_curvecc,
+            pan_curvecc: self.pan_curvecc,
+            curves,
         })
     }
 }
@@ -366,6 +418,17 @@ pub struct RegionParams {
     pub resonance_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
     pub pan_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK: Phase 6 curvecc bindings — each entry (CC, curve_id)
+    /// tells the matching SIMD generator to look up curve[cc_value]
+    /// from `curves` instead of using cc_value/127 directly.
+    pub volume_curvecc: Vec<(u8, u8)>,
+    pub cutoff_curvecc: Vec<(u8, u8)>,
+    pub resonance_curvecc: Vec<(u8, u8)>,
+    pub pan_curvecc: Vec<(u8, u8)>,
+    /// MOVE FORK: Phase 6 `<curve>` blocks parsed from the SFZ. Shared
+    /// across all regions via Arc — region clones are cheap refcount
+    /// bumps. Each curve is a 128-point lookup table.
+    pub curves: Arc<HashMap<u8, [f32; 128]>>,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
@@ -375,6 +438,10 @@ fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
         SfzGroupType::Master => Some(3),
         SfzGroupType::Group => Some(4),
         SfzGroupType::Region => Some(5),
+        // MOVE FORK: <curve> is a sibling of <control>, parsed by
+        // parse_sf_root via a separate code path. Returning None here
+        // keeps it out of the region inheritance stack.
+        SfzGroupType::Curve => None,
         SfzGroupType::Other => None,
     }
 }
@@ -391,18 +458,38 @@ pub(super) fn parse_sf_root(
     // modulators to bake their static contribution. Default 0 for any
     // CC the file didn't initialize.
     let mut cc_state: HashMap<u8, f32> = HashMap::new();
+    // MOVE FORK / Phase 6: <curve> block state. The active curve is
+    // identified by `index=` and populated via `vNNN=` opcodes. On exit
+    // (any non-curve group token after curve content), the assembled
+    // table moves into `curves`.
+    let mut curves: HashMap<u8, [f32; 128]> = HashMap::new();
+    let mut current_curve_id: Option<u8> = None;
+    let mut current_curve_values: [f32; 128] = [0.0; 128];
 
     for token in tokens {
         match token {
             SfzToken::Group(group) => {
+                // Finalize an in-progress curve when leaving the block.
+                if current_group == Some(SfzGroupType::Curve) {
+                    if let Some(id) = current_curve_id.take() {
+                        curves.insert(id, current_curve_values);
+                    }
+                    current_curve_values = [0.0; 128];
+                }
                 if current_group == Some(SfzGroupType::Region) {
                     let next_region = group_data_stack.pop_back().unwrap();
-                    if let Some(built) = next_region.build(&base_path, &cc_state) {
+                    if let Some(built) = next_region.build(
+                        &base_path,
+                        &cc_state,
+                        Arc::new(HashMap::new()), // placeholder; filled at end below via re-walk
+                    ) {
                         regions.push(built);
                     }
                 }
 
-                if let Some(group_level) = get_group_level(group) {
+                if group == SfzGroupType::Curve {
+                    current_group = Some(SfzGroupType::Curve);
+                } else if let Some(group_level) = get_group_level(group) {
                     current_group = Some(group);
 
                     // MOVE FORK: when entering a new header at level N
@@ -424,13 +511,32 @@ pub(super) fn parse_sf_root(
                     current_group = None;
                 }
             }
+            // MOVE FORK / Phase 6: curve block content.
+            SfzToken::Opcode(SfzOpcode::CurveIndex(id))
+                if current_group == Some(SfzGroupType::Curve) =>
+            {
+                // Flush any prior unfinalized curve (same block, new index
+                // — unusual but defensive).
+                if let Some(prev) = current_curve_id.take() {
+                    curves.insert(prev, current_curve_values);
+                    current_curve_values = [0.0; 128];
+                }
+                current_curve_id = Some(id);
+            }
+            SfzToken::Opcode(SfzOpcode::CurvePoint(n, v))
+                if current_group == Some(SfzGroupType::Curve) =>
+            {
+                if (n as usize) < 128 {
+                    current_curve_values[n as usize] = v;
+                }
+            }
             SfzToken::Opcode(SfzOpcode::AriaCcInit(cc_n, value)) => {
                 cc_state.insert(cc_n, value);
             }
             SfzToken::Opcode(SfzOpcode::AriaOncc { base, cc, value }) => {
                 let cc_v = cc_state.get(&cc).copied().unwrap_or(0.0);
                 let contribution = value * cc_v;
-                if current_group.is_some() {
+                if current_group.is_some() && current_group != Some(SfzGroupType::Curve) {
                     if let Some(group_data) = group_data_stack.back_mut() {
                         let env = &mut group_data.ampeg_envelope;
                         match base {
@@ -446,7 +552,7 @@ pub(super) fn parse_sf_root(
                 }
             }
             SfzToken::Opcode(flag) => {
-                if current_group.is_some() {
+                if current_group.is_some() && current_group != Some(SfzGroupType::Curve) {
                     if let Some(group_data) = group_data_stack.back_mut() {
                         group_data.update_from_flag(flag);
                     }
@@ -455,11 +561,31 @@ pub(super) fn parse_sf_root(
         }
     }
 
+    // Finalize trailing curve if the file ends inside one.
+    if current_group == Some(SfzGroupType::Curve) {
+        if let Some(id) = current_curve_id.take() {
+            curves.insert(id, current_curve_values);
+        }
+    }
+
     if current_group == Some(SfzGroupType::Region) {
         let next_region = group_data_stack.pop_back().unwrap();
-        if let Some(built) = next_region.build(&base_path, &cc_state) {
+        if let Some(built) = next_region.build(
+            &base_path,
+            &cc_state,
+            Arc::new(HashMap::new()),
+        ) {
             regions.push(built);
         }
+    }
+
+    // MOVE FORK / Phase 6: backfill the shared curves Arc into every
+    // region. Curves can appear anywhere in the document (commonly
+    // before <region>s but the spec doesn't require it), so we build
+    // them up over the whole pass and attach at the end.
+    let curves_arc = Arc::new(curves);
+    for r in regions.iter_mut() {
+        r.curves = curves_arc.clone();
     }
 
     regions

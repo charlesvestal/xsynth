@@ -44,6 +44,10 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     /// MOVE FORK: live cutoff/resonance oncc bindings.
     cutoff_oncc: Arc<[(u8, f32)]>,
     resonance_oncc: Arc<[(u8, f32)]>,
+    volume_curvecc: Arc<[(u8, u8)]>,
+    cutoff_curvecc: Arc<[(u8, u8)]>,
+    resonance_curvecc: Arc<[(u8, u8)]>,
+    curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
     _s: PhantomData<S>,
 }
 
@@ -81,6 +85,10 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             volume_oncc: params.volume_oncc.clone(),
             cutoff_oncc: params.cutoff_oncc.clone(),
             resonance_oncc: params.resonance_oncc.clone(),
+            volume_curvecc: params.volume_curvecc.clone(),
+            cutoff_curvecc: params.cutoff_curvecc.clone(),
+            resonance_curvecc: params.resonance_curvecc.clone(),
+            curves: params.curves.clone(),
             _s: PhantomData,
         }
     }
@@ -227,7 +235,12 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
-        let oncc = SIMDVoiceOnccAmp::<S>::new(cc_state.clone(), self.volume_oncc.clone());
+        let oncc = SIMDVoiceOnccAmp::<S>::new(
+            cc_state.clone(),
+            self.volume_oncc.clone(),
+            self.volume_curvecc.clone(),
+            self.curves.clone(),
+        );
         VoiceCombineSIMD::mult(oncc, gen)
     }
 
@@ -243,6 +256,9 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
                 cc_state.clone(),
                 self.cutoff_oncc.clone(),
                 self.resonance_oncc.clone(),
+                self.cutoff_curvecc.clone(),
+                self.resonance_curvecc.clone(),
+                self.curves.clone(),
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,
