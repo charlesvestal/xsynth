@@ -94,7 +94,11 @@ impl VoiceChannelParams {
             | ChannelConfigEvent::SetDelay(_)
             | ChannelConfigEvent::SetDelayTime(_)
             | ChannelConfigEvent::SetDelayFeedback(_)
-            | ChannelConfigEvent::SetDelayMix(_) => {}
+            | ChannelConfigEvent::SetDelayMix(_)
+            | ChannelConfigEvent::SetChorus(_)
+            | ChannelConfigEvent::SetChorusRate(_)
+            | ChannelConfigEvent::SetChorusDepth(_)
+            | ChannelConfigEvent::SetChorusMix(_) => {}
         }
     }
 

@@ -191,6 +191,10 @@ pub struct VoiceChannel {
     /// "delay">`). `delay_mix` 0..1 — zero skips processing entirely.
     delay: Option<crate::effects::StereoFeedbackDelay>,
     delay_mix: f32,
+    /// MOVE FORK / Phase 12: stereo chorus. Per-channel LFO-modulated
+    /// short delays. `chorus_mix` is crossfade (DS FX_MIX convention).
+    chorus: Option<crate::effects::StereoChorus>,
+    chorus_mix: f32,
 }
 
 impl VoiceChannel {
@@ -246,6 +250,8 @@ impl VoiceChannel {
             reverb_wet: 0.0,
             delay: None,
             delay_mix: 0.0,
+            chorus: None,
+            chorus_mix: 0.0,
         }
     }
 
@@ -337,6 +343,20 @@ impl VoiceChannel {
                         let (wl, wr) = delay.process(sample[0], sample[1]);
                         sample[0] = sample[0] + wl * send;
                         sample[1] = sample[1] + wr * send;
+                    }
+                }
+            }
+        }
+
+        // MOVE FORK / Phase 12: stereo chorus. FX_MIX = crossfade
+        // (DS modulation FX convention). Skipped when mix=0.
+        if self.chorus_mix > 0.0 {
+            if let Some(chorus) = self.chorus.as_mut() {
+                if let ChannelCount::Stereo = self.stream_params.channels {
+                    for sample in out.chunks_mut(2) {
+                        let (wl, wr) = chorus.process(sample[0], sample[1]);
+                        sample[0] = wl;
+                        sample[1] = wr;
                     }
                 }
             }
@@ -602,6 +622,28 @@ impl VoiceChannel {
                         ChannelConfigEvent::SetDelayMix(m) => {
                             self.delay_mix = m.clamp(0.0, 1.0);
                         }
+                        ChannelConfigEvent::SetChorus(params) => {
+                            if let Some((rate, depth)) = params {
+                                let mut c = crate::effects::StereoChorus::new(
+                                    self.stream_params.sample_rate as f32,
+                                );
+                                c.set_rate(rate);
+                                c.set_depth(depth);
+                                self.chorus = Some(c);
+                            } else {
+                                self.chorus = None;
+                            }
+                        }
+                        ChannelConfigEvent::SetChorusRate(r) => {
+                            if let Some(c) = self.chorus.as_mut() { c.set_rate(r); }
+                        }
+                        ChannelConfigEvent::SetChorusDepth(d) => {
+                            if let Some(c) = self.chorus.as_mut() { c.set_depth(d); }
+                        }
+                        ChannelConfigEvent::SetChorusMix(m) => {
+                            self.chorus_mix = m.clamp(0.0, 1.0);
+                            if let Some(c) = self.chorus.as_mut() { c.set_mix(m); }
+                        }
                         other => self.params.process_config_event(other),
                     }
                 }
@@ -646,6 +688,10 @@ impl VoiceChannel {
         }
         // Same for delay — drain the feedback tail after the last note.
         if self.delay_mix > 0.0 && self.delay.is_some() {
+            return true;
+        }
+        // Chorus has a tiny tail (~30ms) — keep rendering while wet.
+        if self.chorus_mix > 0.0 && self.chorus.is_some() {
             return true;
         }
         false

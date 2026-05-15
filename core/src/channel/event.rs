@@ -79,6 +79,18 @@ pub enum ChannelConfigEvent {
 
     /// MOVE FORK / Phase 9: dry/wet mix (0..1). Zero skips processing.
     SetDelayMix(f32),
+
+    /// MOVE FORK / Phase 12: install/remove stereo chorus on the
+    /// channel post-mix. `Some((rate, depth))` = install with the
+    /// given LFO rate (Hz) and depth (0..1 fraction of center delay).
+    /// `None` removes (drops the ring buffers).
+    SetChorus(Option<(f32, f32)>),
+    /// MOVE FORK / Phase 12: live rate update.
+    SetChorusRate(f32),
+    /// MOVE FORK / Phase 12: live depth update.
+    SetChorusDepth(f32),
+    /// MOVE FORK / Phase 12: dry/wet mix (crossfade, 0..1).
+    SetChorusMix(f32),
 }
 
 /// MIDI events for a channel.
