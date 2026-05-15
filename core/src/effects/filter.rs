@@ -71,8 +71,13 @@ impl BiQuadFilter {
 }
 
 fn sanitize_freq(freq: f32, sample_rate: f32) -> f32 {
-    let nyquist = (sample_rate * 0.5).max(1.0);
-    let max_freq = (nyquist - 1.0).max(1.0);
+    // MOVE FORK: bilinear transform makes biquad coefficients diverge as
+    // f → sample_rate/2 (K = tan(πf/sr) blows up). The previous `nyquist
+    // - 1` margin was 1 Hz at 48 kHz — well inside the unstable region.
+    // K4-Acoustic produced unbounded noise + NaN when knob bindings
+    // pushed cutoff to ~22 kHz. 0.45·sr keeps tan(πf/sr) ≤ ~6, which is
+    // numerically stable for the Q values we emit.
+    let max_freq = (sample_rate * 0.45).max(1.0);
     freq.clamp(1.0, max_freq)
 }
 
