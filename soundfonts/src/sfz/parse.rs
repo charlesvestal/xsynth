@@ -432,6 +432,18 @@ fn parse_sfz_opcode(
                 }
                 return Ok(None);
             }
+            if base_name == "fillfo_freq" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(FilLfoFreqOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "fillfo_depth" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(FilLfoDepthOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
             let base = match base_name {
                 "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
                 "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
