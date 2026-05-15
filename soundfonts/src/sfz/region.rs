@@ -89,6 +89,11 @@ pub(crate) struct RegionParamsBuilder {
     /// MOVE FORK / Phase 11: SFZ amp LFO (sine tremolo).
     amp_lfo_freq: f32,
     amp_lfo_depth: f32,
+    /// MOVE FORK / Phase 11: live CC mod of amp LFO. Each entry is
+    /// (CC, delta) — at CC=127 the LFO freq/depth becomes
+    /// base + delta. Per-CC last-wins like volume_oncc.
+    amp_lfo_freq_oncc: Vec<(u8, f32)>,
+    amp_lfo_depth_oncc: Vec<(u8, f32)>,
     offset: u32,
     cutoff: Option<f32>,
     resonance: f32,
@@ -155,6 +160,8 @@ impl Default for RegionParamsBuilder {
             loop_crossfade: 0.0,
             amp_lfo_freq: 0.0,
             amp_lfo_depth: 0.0,
+            amp_lfo_freq_oncc: Vec::new(),
+            amp_lfo_depth_oncc: Vec::new(),
             offset: 0,
             cutoff: None,
             resonance: 0.0,
@@ -208,6 +215,20 @@ impl RegionParamsBuilder {
             SfzOpcode::LoopCrossfade(val) => self.loop_crossfade = val,
             SfzOpcode::AmpLfoFreq(val) => self.amp_lfo_freq = val,
             SfzOpcode::AmpLfoDepth(val) => self.amp_lfo_depth = val,
+            SfzOpcode::AmpLfoFreqOncc(cc, v) => {
+                if let Some(existing) = self.amp_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.amp_lfo_freq_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::AmpLfoDepthOncc(cc, v) => {
+                if let Some(existing) = self.amp_lfo_depth_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.amp_lfo_depth_oncc.push((cc, v));
+                }
+            }
             SfzOpcode::Offset(val) => self.offset = val,
             SfzOpcode::Cutoff(val) => self.cutoff = Some(val),
             SfzOpcode::Resonance(val) => self.resonance = val,
@@ -357,6 +378,8 @@ impl RegionParamsBuilder {
             loop_crossfade: self.loop_crossfade,
             amp_lfo_freq: self.amp_lfo_freq,
             amp_lfo_depth: self.amp_lfo_depth,
+            amp_lfo_freq_oncc: self.amp_lfo_freq_oncc,
+            amp_lfo_depth_oncc: self.amp_lfo_depth_oncc,
             offset: self.offset,
             cutoff: self.cutoff,
             resonance: self.resonance,
@@ -406,6 +429,9 @@ pub struct RegionParams {
     /// zero depth = inactive.
     pub amp_lfo_freq: f32,
     pub amp_lfo_depth: f32,
+    /// MOVE FORK / Phase 11: live CC modulation of amp LFO params.
+    pub amp_lfo_freq_oncc: Vec<(u8, f32)>,
+    pub amp_lfo_depth_oncc: Vec<(u8, f32)>,
     pub offset: u32,
     pub cutoff: Option<f32>,
     pub resonance: f32,

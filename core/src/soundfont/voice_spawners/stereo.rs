@@ -64,6 +64,8 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     /// MOVE FORK / Phase 11: amp LFO params.
     amp_lfo_freq: f32,
     amp_lfo_depth: f32,
+    amp_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    amp_lfo_depth_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -110,6 +112,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             curves: params.curves.clone(),
             amp_lfo_freq: params.amp_lfo_freq,
             amp_lfo_depth: params.amp_lfo_depth,
+            amp_lfo_freq_oncc: params.amp_lfo_freq_oncc.clone(),
+            amp_lfo_depth_oncc: params.amp_lfo_depth_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -262,7 +266,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     {
         let gen = self.apply_velocity(gen);
         let gen = self.apply_volume_oncc(gen, cc_state);
-        let gen = self.apply_amp_lfo(gen);
+        let gen = self.apply_amp_lfo(gen, cc_state);
         let gen = self.apply_pan(gen, cc_state);
         let gen = self.apply_envelope(gen, control);
 
@@ -282,15 +286,18 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     /// inserted; the SIMDVoiceLfoAmp short-circuits to constant 1.0
     /// when freq or depth is zero (same cost as a static SIMDConstant
     /// stage in that case).
-    fn apply_amp_lfo<Gen, Sample>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, Sample>
+    fn apply_amp_lfo<Gen, Sample>(&self, gen: Gen, cc_state: &CcState) -> impl SIMDVoiceGenerator<S, Sample>
     where
         Sample: SIMDSample<S>,
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
         let lfo = SIMDVoiceLfoAmp::<S>::new(
+            cc_state.clone(),
             self.amp_lfo_freq, self.amp_lfo_depth,
             self.stream_params.sample_rate as f32,
+            self.amp_lfo_freq_oncc.clone(),
+            self.amp_lfo_depth_oncc.clone(),
         );
         VoiceCombineSIMD::mult(lfo, gen)
     }

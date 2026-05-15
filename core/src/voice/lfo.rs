@@ -14,11 +14,13 @@
 // the LFO stays in sync — we just sample the resulting amp at
 // coarser granularity to save sin() / powf() calls.
 
+use std::sync::{atomic::Ordering, Arc};
+
 use simdeez::prelude::*;
 
 use crate::{
     helpers::db_to_amp,
-    voice::{ReleaseType, VoiceControlData},
+    voice::{CcState, ReleaseType, VoiceControlData},
 };
 
 use super::{SIMDSampleMono, SIMDVoiceGenerator, VoiceGeneratorBase};
@@ -26,36 +28,71 @@ use super::{SIMDSampleMono, SIMDVoiceGenerator, VoiceGeneratorBase};
 const RECOMPUTE_INTERVAL: u32 = 8;
 
 pub struct SIMDVoiceLfoAmp<S: Simd> {
-    /// Radians per audio sample (2π·freq / sample_rate).
-    phase_inc: f32,
+    cc_state: CcState,
+    /// Live CC routing for freq (Hz delta added at cc/127).
+    freq_oncc: Arc<[(u8, f32)]>,
+    /// Live CC routing for depth (dB delta added at cc/127).
+    depth_oncc: Arc<[(u8, f32)]>,
+    sample_rate: f32,
+    base_freq: f32,
+    base_depth_db: f32,
     /// Current phase in radians.
     phase: f32,
-    /// Depth in dB (sin output range is [-depth_db, depth_db]).
-    depth_db: f32,
     /// Cached amp output, refreshed every RECOMPUTE_INTERVAL vectors.
     values: S::Vf32,
     countdown: u32,
+    /// True when the LFO can never become active (base + max CC delta
+    /// keeps freq or depth at 0). Cheap short-circuit.
     static_amp: bool,
 }
 
 impl<S: Simd> SIMDVoiceLfoAmp<S> {
-    pub fn new(freq_hz: f32, depth_db: f32, sample_rate: f32) -> Self {
-        let static_amp = depth_db <= 0.0 || freq_hz <= 0.0;
-        let phase_inc = if static_amp {
-            0.0
-        } else {
-            2.0 * std::f32::consts::PI * freq_hz / sample_rate
-        };
+    pub fn new(
+        cc_state: CcState,
+        freq_hz: f32,
+        depth_db: f32,
+        sample_rate: f32,
+        freq_oncc: Arc<[(u8, f32)]>,
+        depth_oncc: Arc<[(u8, f32)]>,
+    ) -> Self {
+        // A region with no oncc routing AND base freq/depth both
+        // zero can never produce tremolo. With oncc routing the LFO
+        // becomes live as soon as a CC moves.
+        let max_freq_delta: f32 = freq_oncc.iter().map(|(_, d)| d.abs()).sum();
+        let max_depth_delta: f32 = depth_oncc.iter().map(|(_, d)| d.abs()).sum();
+        let static_amp = (freq_hz + max_freq_delta) <= 0.0
+            || (depth_db + max_depth_delta) <= 0.0;
         simd_invoke!(S, {
             SIMDVoiceLfoAmp {
-                phase_inc,
+                cc_state,
+                freq_oncc,
+                depth_oncc,
+                sample_rate,
+                base_freq: freq_hz,
+                base_depth_db: depth_db,
                 phase: 0.0,
-                depth_db,
                 values: S::Vf32::set1(1.0),
                 countdown: 0,
                 static_amp,
             }
         })
+    }
+
+    #[inline]
+    fn live_params(&self) -> (f32, f32) {
+        let mut freq = self.base_freq;
+        for (cc, delta) in self.freq_oncc.iter() {
+            let v = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
+            freq += delta * v;
+        }
+        let mut depth = self.base_depth_db;
+        for (cc, delta) in self.depth_oncc.iter() {
+            let v = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
+            depth += delta * v;
+        }
+        if freq < 0.0 { freq = 0.0; }
+        if depth < 0.0 { depth = 0.0; }
+        (freq, depth)
     }
 }
 
@@ -72,17 +109,19 @@ impl<S: Simd> SIMDVoiceGenerator<S, SIMDSampleMono<S>> for SIMDVoiceLfoAmp<S> {
     #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<S> {
         if !self.static_amp {
-            // Advance phase per SIMD-vector tick (one vector = WIDTH
-            // audio samples — assume 4 for aarch64 NEON; the error is
-            // bounded since phase is wrapped). Recompute amp on a
-            // coarse counter.
-            self.phase += self.phase_inc * 4.0;
+            let (freq, depth_db) = self.live_params();
+            // Advance phase per SIMD-vector tick (4 samples assumed).
+            let phase_inc = 2.0 * std::f32::consts::PI * freq / self.sample_rate;
+            self.phase += phase_inc * 4.0;
             if self.phase > 2.0 * std::f32::consts::PI {
                 self.phase -= 2.0 * std::f32::consts::PI;
             }
             if self.countdown == 0 {
-                let sin_val = self.phase.sin();
-                let amp = db_to_amp(sin_val * self.depth_db);
+                let amp = if depth_db > 0.0 && freq > 0.0 {
+                    db_to_amp(self.phase.sin() * depth_db)
+                } else {
+                    1.0
+                };
                 simd_invoke!(S, {
                     self.values = S::Vf32::set1(amp);
                 });

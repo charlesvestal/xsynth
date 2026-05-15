@@ -41,6 +41,11 @@ pub enum SfzOpcode {
     /// (dB) — sine LFO modulating the voice's amp.
     AmpLfoFreq(f32),
     AmpLfoDepth(f32),
+    /// MOVE FORK / Phase 11: live CC modulation of amp LFO freq/depth.
+    /// `amplfo_freq_oncc<N>=<Hz delta>` — at CC=127, freq becomes
+    /// base + delta. `amplfo_depth_oncc<N>=<dB delta>` — same for depth.
+    AmpLfoFreqOncc(u8, f32),
+    AmpLfoDepthOncc(u8, f32),
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
@@ -406,6 +411,18 @@ fn parse_sfz_opcode(
             if base_name == "pan" {
                 if let Ok(v) = val.parse::<f32>() {
                     return Ok(Some(PanOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "amplfo_freq" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(AmpLfoFreqOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "amplfo_depth" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(AmpLfoDepthOncc(cc_n, v)));
                 }
                 return Ok(None);
             }
