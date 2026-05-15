@@ -215,6 +215,11 @@ impl RegionParamsBuilder {
             SfzOpcode::LoopCrossfade(val) => self.loop_crossfade = val,
             SfzOpcode::AmpLfoFreq(val) => self.amp_lfo_freq = val,
             SfzOpcode::AmpLfoDepth(val) => self.amp_lfo_depth = val,
+            /* Filter LFO opcodes — parsed but not yet consumed; the
+             * data path will land in a follow-up. Accept so the match
+             * is exhaustive. */
+            SfzOpcode::FilLfoFreq(_) | SfzOpcode::FilLfoDepth(_)
+            | SfzOpcode::FilLfoFreqOncc(_, _) | SfzOpcode::FilLfoDepthOncc(_, _) => {}
             SfzOpcode::AmpLfoFreqOncc(cc, v) => {
                 if let Some(existing) = self.amp_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
                     existing.1 = v;

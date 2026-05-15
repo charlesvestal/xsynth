@@ -46,6 +46,12 @@ pub enum SfzOpcode {
     /// base + delta. `amplfo_depth_oncc<N>=<dB delta>` — same for depth.
     AmpLfoFreqOncc(u8, f32),
     AmpLfoDepthOncc(u8, f32),
+    /// MOVE FORK / Phase 11: SFZ `fillfo_freq` (Hz) + `fillfo_depth`
+    /// (cents) — sine LFO modulating the voice's filter cutoff.
+    FilLfoFreq(f32),
+    FilLfoDepth(f32),
+    FilLfoFreqOncc(u8, f32),
+    FilLfoDepthOncc(u8, f32),
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
@@ -511,6 +517,8 @@ fn parse_sfz_opcode(
         "loop_crossfade" | "loopcrossfade" => val.parse::<f32>().ok().map(LoopCrossfade),
         "amplfo_freq" => val.parse::<f32>().ok().map(AmpLfoFreq),
         "amplfo_depth" => val.parse::<f32>().ok().map(AmpLfoDepth),
+        "fillfo_freq" => val.parse::<f32>().ok().map(FilLfoFreq),
+        "fillfo_depth" => val.parse::<f32>().ok().map(FilLfoDepth),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),
