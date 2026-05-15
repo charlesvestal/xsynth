@@ -94,6 +94,13 @@ pub(crate) struct RegionParamsBuilder {
     /// base + delta. Per-CC last-wins like volume_oncc.
     amp_lfo_freq_oncc: Vec<(u8, f32)>,
     amp_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: filter LFO (sine on cutoff).
+    /// depth is in cents (SFZ standard); LiveCutoffState applies
+    /// `freq *= 2^(sin · depth / 1200)`.
+    fil_lfo_freq: f32,
+    fil_lfo_depth: f32,
+    fil_lfo_freq_oncc: Vec<(u8, f32)>,
+    fil_lfo_depth_oncc: Vec<(u8, f32)>,
     offset: u32,
     cutoff: Option<f32>,
     resonance: f32,
@@ -162,6 +169,10 @@ impl Default for RegionParamsBuilder {
             amp_lfo_depth: 0.0,
             amp_lfo_freq_oncc: Vec::new(),
             amp_lfo_depth_oncc: Vec::new(),
+            fil_lfo_freq: 0.0,
+            fil_lfo_depth: 0.0,
+            fil_lfo_freq_oncc: Vec::new(),
+            fil_lfo_depth_oncc: Vec::new(),
             offset: 0,
             cutoff: None,
             resonance: 0.0,
@@ -215,11 +226,22 @@ impl RegionParamsBuilder {
             SfzOpcode::LoopCrossfade(val) => self.loop_crossfade = val,
             SfzOpcode::AmpLfoFreq(val) => self.amp_lfo_freq = val,
             SfzOpcode::AmpLfoDepth(val) => self.amp_lfo_depth = val,
-            /* Filter LFO opcodes — parsed but not yet consumed; the
-             * data path will land in a follow-up. Accept so the match
-             * is exhaustive. */
-            SfzOpcode::FilLfoFreq(_) | SfzOpcode::FilLfoDepth(_)
-            | SfzOpcode::FilLfoFreqOncc(_, _) | SfzOpcode::FilLfoDepthOncc(_, _) => {}
+            SfzOpcode::FilLfoFreq(val) => self.fil_lfo_freq = val,
+            SfzOpcode::FilLfoDepth(val) => self.fil_lfo_depth = val,
+            SfzOpcode::FilLfoFreqOncc(cc, v) => {
+                if let Some(existing) = self.fil_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.fil_lfo_freq_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::FilLfoDepthOncc(cc, v) => {
+                if let Some(existing) = self.fil_lfo_depth_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.fil_lfo_depth_oncc.push((cc, v));
+                }
+            }
             SfzOpcode::AmpLfoFreqOncc(cc, v) => {
                 if let Some(existing) = self.amp_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
                     existing.1 = v;
@@ -385,6 +407,10 @@ impl RegionParamsBuilder {
             amp_lfo_depth: self.amp_lfo_depth,
             amp_lfo_freq_oncc: self.amp_lfo_freq_oncc,
             amp_lfo_depth_oncc: self.amp_lfo_depth_oncc,
+            fil_lfo_freq: self.fil_lfo_freq,
+            fil_lfo_depth: self.fil_lfo_depth,
+            fil_lfo_freq_oncc: self.fil_lfo_freq_oncc,
+            fil_lfo_depth_oncc: self.fil_lfo_depth_oncc,
             offset: self.offset,
             cutoff: self.cutoff,
             resonance: self.resonance,
@@ -437,6 +463,11 @@ pub struct RegionParams {
     /// MOVE FORK / Phase 11: live CC modulation of amp LFO params.
     pub amp_lfo_freq_oncc: Vec<(u8, f32)>,
     pub amp_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: filter LFO (sine on cutoff, depth in cents).
+    pub fil_lfo_freq: f32,
+    pub fil_lfo_depth: f32,
+    pub fil_lfo_freq_oncc: Vec<(u8, f32)>,
+    pub fil_lfo_depth_oncc: Vec<(u8, f32)>,
     pub offset: u32,
     pub cutoff: Option<f32>,
     pub resonance: f32,

@@ -53,6 +53,15 @@ struct LiveCutoffState {
     cutoff_curvecc: Arc<[(u8, u8)]>,
     resonance_curvecc: Arc<[(u8, u8)]>,
     curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+    /// MOVE FORK / Phase 11: filter LFO source — sine wave at
+    /// `fil_lfo_freq` Hz, depth in cents. Applied multiplicatively
+    /// to the cutoff: `freq *= 2^(sin · depth / 1200)`.
+    fil_lfo_freq: f32,
+    fil_lfo_depth: f32,
+    fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    /// Running phase in radians.
+    lfo_phase: f32,
     fil_type: FilterType,
     sample_rate: f32,
     base_freq: f32,
@@ -76,12 +85,21 @@ impl LiveCutoffState {
         cutoff_curvecc: Arc<[(u8, u8)]>,
         resonance_curvecc: Arc<[(u8, u8)]>,
         curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+        fil_lfo_freq: f32,
+        fil_lfo_depth: f32,
+        fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
+        fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
         base_resonance_db: f32,
     ) -> Self {
-        let static_filter = cutoff_oncc.is_empty() && resonance_oncc.is_empty();
+        let max_lfo_freq_delta: f32 = fil_lfo_freq_oncc.iter().map(|(_, d)| d.abs()).sum();
+        let max_lfo_depth_delta: f32 = fil_lfo_depth_oncc.iter().map(|(_, d)| d.abs()).sum();
+        let has_lfo = (fil_lfo_freq + max_lfo_freq_delta) > 0.0
+            && (fil_lfo_depth + max_lfo_depth_delta) > 0.0;
+        let static_filter = cutoff_oncc.is_empty() && resonance_oncc.is_empty()
+            && !has_lfo;
         // 10ms smoothing time constant. tick_samples = RECOMPUTE_INTERVAL
         // * a SIMD vector width (assume 4 for aarch64 NEON; the exact
         // value isn't critical — alpha just controls smoothing speed,
@@ -98,6 +116,11 @@ impl LiveCutoffState {
             cutoff_curvecc,
             resonance_curvecc,
             curves,
+            fil_lfo_freq,
+            fil_lfo_depth,
+            fil_lfo_freq_oncc,
+            fil_lfo_depth_oncc,
+            lfo_phase: 0.0,
             fil_type,
             sample_rate,
             base_freq,
@@ -110,13 +133,39 @@ impl LiveCutoffState {
         }
     }
 
-    /// Target (freq, Q) from the live CC state.
+    /// Target (freq, Q) from the live CC state + filter LFO.
+    /// Mutates `lfo_phase`; call once per tick.
     #[inline]
-    fn target(&self) -> (f32, f32) {
+    fn target(&mut self) -> (f32, f32) {
         let mut cents_sum = 0.0_f32;
         for (cc, delta) in self.cutoff_oncc.iter() {
             let cc_val = self.cc_state[*cc as usize].load(Ordering::Relaxed);
             cents_sum += delta * cc_lookup(cc_val, *cc, &self.cutoff_curvecc, &self.curves);
+        }
+        // MOVE FORK / Phase 11: filter LFO contribution. Compute live
+        // freq + depth from base + oncc, advance phase by the per-tick
+        // amount (tick = RECOMPUTE_INTERVAL * SIMD vector = ~32 audio
+        // frames at NEON WIDTH=4), then add sin(phase) · depth cents
+        // to cents_sum.
+        let mut lfo_freq = self.fil_lfo_freq;
+        for (cc, delta) in self.fil_lfo_freq_oncc.iter() {
+            let cc_val = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
+            lfo_freq += delta * cc_val;
+        }
+        let mut lfo_depth = self.fil_lfo_depth;
+        for (cc, delta) in self.fil_lfo_depth_oncc.iter() {
+            let cc_val = self.cc_state[*cc as usize].load(Ordering::Relaxed) as f32 / 127.0;
+            lfo_depth += delta * cc_val;
+        }
+        if lfo_freq > 0.0 && lfo_depth > 0.0 {
+            // Advance phase by tick samples (~32). Wraps each cycle.
+            let tick_samples = RECOMPUTE_INTERVAL as f32 * 4.0;
+            self.lfo_phase += 2.0 * std::f32::consts::PI * lfo_freq * tick_samples
+                / self.sample_rate;
+            if self.lfo_phase > 2.0 * std::f32::consts::PI {
+                self.lfo_phase -= 2.0 * std::f32::consts::PI;
+            }
+            cents_sum += self.lfo_phase.sin() * lfo_depth;
         }
         let mut db_sum = self.base_resonance_db;
         for (cc, delta) in self.resonance_oncc.iter() {
@@ -309,6 +358,10 @@ where
         cutoff_curvecc: Arc<[(u8, u8)]>,
         resonance_curvecc: Arc<[(u8, u8)]>,
         curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+        fil_lfo_freq: f32,
+        fil_lfo_depth: f32,
+        fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
+        fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -324,6 +377,10 @@ where
                 cutoff_curvecc,
                 resonance_curvecc,
                 curves,
+                fil_lfo_freq,
+                fil_lfo_depth,
+                fil_lfo_freq_oncc,
+                fil_lfo_depth_oncc,
                 fil_type,
                 sample_rate,
                 base_freq,
@@ -396,6 +453,10 @@ where
         cutoff_curvecc: Arc<[(u8, u8)]>,
         resonance_curvecc: Arc<[(u8, u8)]>,
         curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+        fil_lfo_freq: f32,
+        fil_lfo_depth: f32,
+        fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
+        fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -412,6 +473,10 @@ where
                 cutoff_curvecc,
                 resonance_curvecc,
                 curves,
+                fil_lfo_freq,
+                fil_lfo_depth,
+                fil_lfo_freq_oncc,
+                fil_lfo_depth_oncc,
                 fil_type,
                 sample_rate,
                 base_freq,

@@ -52,6 +52,10 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     amp_lfo_depth: f32,
     amp_lfo_freq_oncc: Arc<[(u8, f32)]>,
     amp_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    fil_lfo_freq: f32,
+    fil_lfo_depth: f32,
+    fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -97,6 +101,10 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             amp_lfo_depth: params.amp_lfo_depth,
             amp_lfo_freq_oncc: params.amp_lfo_freq_oncc.clone(),
             amp_lfo_depth_oncc: params.amp_lfo_depth_oncc.clone(),
+            fil_lfo_freq: params.fil_lfo_freq,
+            fil_lfo_depth: params.fil_lfo_depth,
+            fil_lfo_freq_oncc: params.fil_lfo_freq_oncc.clone(),
+            fil_lfo_depth_oncc: params.fil_lfo_depth_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -285,6 +293,10 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
                 self.cutoff_curvecc.clone(),
                 self.resonance_curvecc.clone(),
                 self.curves.clone(),
+                self.fil_lfo_freq,
+                self.fil_lfo_depth,
+                self.fil_lfo_freq_oncc.clone(),
+                self.fil_lfo_depth_oncc.clone(),
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,
