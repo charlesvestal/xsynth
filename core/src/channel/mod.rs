@@ -304,41 +304,39 @@ impl VoiceChannel {
             self.cutoff.process(out);
         }
 
-        // MOVE FORK / Phase 9 prototype: stereo reverb send. Skipped
-        // entirely when `reverb_wet == 0` so dry presets pay zero
-        // cost (the common case until users opt in). When active,
-        // tick the AudioUnit per stereo frame and mix in.
+        // MOVE FORK / Phase 9/10: DS `wetLevel` is documented as
+        // "the volume of the [delay|reverb] signal" — additive send,
+        // NOT a dry/wet crossfade. Confirmed by canonical DS delay
+        // example where the wetLevel knob defaults to 1.0 (would
+        // mute the sampler under crossfade). FX_MIX (chorus/phaser)
+        // IS crossfade per DS convention; FX_WET_LEVEL is additive.
+        //
+        // Topology: `out = dry + send · wet`. Dry stays at unity;
+        // the wet bus rides underneath at `send` (the author's
+        // wetLevel). No engine-specific trim — author intent rules.
         if self.reverb_wet > 0.0 {
             if let Some(reverb) = self.reverb.as_mut() {
-                let dry_gain = 1.0 - self.reverb_wet;
-                let wet_gain = self.reverb_wet;
+                let send = self.reverb_wet;
                 if let ChannelCount::Stereo = self.stream_params.channels {
                     for sample in out.chunks_mut(2) {
                         let input = [sample[0], sample[1]];
                         let mut output = [0.0f32; 2];
                         reverb.tick(&input, &mut output);
-                        sample[0] = sample[0] * dry_gain + output[0] * wet_gain;
-                        sample[1] = sample[1] * dry_gain + output[1] * wet_gain;
+                        sample[0] = sample[0] + output[0] * send;
+                        sample[1] = sample[1] + output[1] * send;
                     }
                 }
             }
         }
 
-        // MOVE FORK / Phase 9: stereo feedback delay. Same dry/wet
-        // mix discipline as reverb — zero mix skips entirely. The
-        // delay always feeds back its own line at the configured
-        // feedback level; that ring is preserved across `mix=0`
-        // disable so re-enabling resumes the tail rather than
-        // restarting.
         if self.delay_mix > 0.0 {
             if let Some(delay) = self.delay.as_mut() {
-                let dry_gain = 1.0 - self.delay_mix;
-                let wet_gain = self.delay_mix;
+                let send = self.delay_mix;
                 if let ChannelCount::Stereo = self.stream_params.channels {
                     for sample in out.chunks_mut(2) {
                         let (wl, wr) = delay.process(sample[0], sample[1]);
-                        sample[0] = sample[0] * dry_gain + wl * wet_gain;
-                        sample[1] = sample[1] * dry_gain + wr * wet_gain;
+                        sample[0] = sample[0] + wl * send;
+                        sample[1] = sample[1] + wr * send;
                     }
                 }
             }

@@ -127,6 +127,10 @@ struct SampleVoiceSpawnerParams {
     /// MOVE FORK: Phase 6 curve tables shared across regions. Empty
     /// HashMap when the SFZ has no `<curve>` blocks.
     curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+    /// MOVE FORK / Phase 11: amp LFO (sine tremolo). Zero values =
+    /// inactive (static_amp short-circuit in SIMDVoiceLfoAmp).
+    amp_lfo_freq: f32,
+    amp_lfo_depth: f32,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -504,6 +508,8 @@ impl SampleSoundfont {
                         resonance_curvecc: resonance_curvecc.clone(),
                         pan_curvecc: pan_curvecc.clone(),
                         curves: curves.clone(),
+                        amp_lfo_freq: region.amp_lfo_freq,
+                        amp_lfo_depth: region.amp_lfo_depth,
                     });
 
                     // MOVE FORK: track max seq_length seen at this slot
@@ -692,6 +698,8 @@ impl SampleSoundfont {
                             resonance_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
                             pan_curvecc: Arc::from(Vec::<(u8, u8)>::new()),
                             curves: Arc::new(std::collections::HashMap::new()),
+                            amp_lfo_freq: 0.0,
+                            amp_lfo_depth: 0.0,
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());

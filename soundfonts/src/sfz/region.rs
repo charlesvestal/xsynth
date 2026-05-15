@@ -86,6 +86,9 @@ pub(crate) struct RegionParamsBuilder {
     /// MOVE FORK / Phase 8: SFZ `loop_crossfade=` in seconds. Converted
     /// to frame count downstream.
     loop_crossfade: f32,
+    /// MOVE FORK / Phase 11: SFZ amp LFO (sine tremolo).
+    amp_lfo_freq: f32,
+    amp_lfo_depth: f32,
     offset: u32,
     cutoff: Option<f32>,
     resonance: f32,
@@ -150,6 +153,8 @@ impl Default for RegionParamsBuilder {
             loop_start: 0,
             loop_end: 0,
             loop_crossfade: 0.0,
+            amp_lfo_freq: 0.0,
+            amp_lfo_depth: 0.0,
             offset: 0,
             cutoff: None,
             resonance: 0.0,
@@ -201,6 +206,8 @@ impl RegionParamsBuilder {
             SfzOpcode::LoopStart(val) => self.loop_start = val,
             SfzOpcode::LoopEnd(val) => self.loop_end = val,
             SfzOpcode::LoopCrossfade(val) => self.loop_crossfade = val,
+            SfzOpcode::AmpLfoFreq(val) => self.amp_lfo_freq = val,
+            SfzOpcode::AmpLfoDepth(val) => self.amp_lfo_depth = val,
             SfzOpcode::Offset(val) => self.offset = val,
             SfzOpcode::Cutoff(val) => self.cutoff = Some(val),
             SfzOpcode::Resonance(val) => self.resonance = val,
@@ -348,6 +355,8 @@ impl RegionParamsBuilder {
             loop_start: self.loop_start,
             loop_end: self.loop_end,
             loop_crossfade: self.loop_crossfade,
+            amp_lfo_freq: self.amp_lfo_freq,
+            amp_lfo_depth: self.amp_lfo_depth,
             offset: self.offset,
             cutoff: self.cutoff,
             resonance: self.resonance,
@@ -393,6 +402,10 @@ pub struct RegionParams {
     pub loop_end: u32,
     /// MOVE FORK / Phase 8: loop crossfade duration in seconds.
     pub loop_crossfade: f32,
+    /// MOVE FORK / Phase 11: amp LFO (sine tremolo). Zero freq /
+    /// zero depth = inactive.
+    pub amp_lfo_freq: f32,
+    pub amp_lfo_depth: f32,
     pub offset: u32,
     pub cutoff: Option<f32>,
     pub resonance: f32,

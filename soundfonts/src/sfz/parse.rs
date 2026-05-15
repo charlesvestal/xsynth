@@ -37,6 +37,10 @@ pub enum SfzOpcode {
     /// Stored on the region as raw f32 seconds; converted to frame
     /// count at voice spawn (rate * seconds).
     LoopCrossfade(f32),
+    /// MOVE FORK / Phase 11: SFZ `amplfo_freq` (Hz) + `amplfo_depth`
+    /// (dB) — sine LFO modulating the voice's amp.
+    AmpLfoFreq(f32),
+    AmpLfoDepth(f32),
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
@@ -488,6 +492,8 @@ fn parse_sfz_opcode(
         "loop_start" | "loopstart" => parse_u32_in_range(val, 0..=u32::MAX).map(LoopStart),
         "loop_end" | "loopend" => parse_u32_in_range(val, 0..=u32::MAX).map(LoopEnd),
         "loop_crossfade" | "loopcrossfade" => val.parse::<f32>().ok().map(LoopCrossfade),
+        "amplfo_freq" => val.parse::<f32>().ok().map(AmpLfoFreq),
+        "amplfo_depth" => val.parse::<f32>().ok().map(AmpLfoDepth),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),

@@ -15,7 +15,7 @@ use crate::{
     voice::{
         BufferSamplers, CcState, EnvelopeParameters, SIMDConstant, SIMDLinearSampleGrabber, SIMDMonoVoice,
         SIMDMonoVoiceSampler, SIMDNearestSampleGrabber, SIMDVoiceControl, SIMDVoiceEnvelope,
-        SIMDVoiceOnccAmp, SampleReader, SampleReaderLoop, SampleReaderLoopSustain,
+        SIMDVoiceLfoAmp, SIMDVoiceOnccAmp, SampleReader, SampleReaderLoop, SampleReaderLoopSustain,
         SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
     },
 };
@@ -48,6 +48,8 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     cutoff_curvecc: Arc<[(u8, u8)]>,
     resonance_curvecc: Arc<[(u8, u8)]>,
     curves: Arc<std::collections::HashMap<u8, [f32; 128]>>,
+    amp_lfo_freq: f32,
+    amp_lfo_depth: f32,
     _s: PhantomData<S>,
 }
 
@@ -89,6 +91,8 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             cutoff_curvecc: params.cutoff_curvecc.clone(),
             resonance_curvecc: params.resonance_curvecc.clone(),
             curves: params.curves.clone(),
+            amp_lfo_freq: params.amp_lfo_freq,
+            amp_lfo_depth: params.amp_lfo_depth,
             _s: PhantomData,
         }
     }
@@ -219,9 +223,24 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
     {
         let gen = self.apply_velocity(gen);
         let gen = self.apply_volume_oncc(gen, cc_state);
+        let gen = self.apply_amp_lfo(gen);
         let gen = self.apply_envelope(gen, control);
 
         self.apply_cutoff_effect(gen, cc_state)
+    }
+
+    /// MOVE FORK / Phase 11: amp LFO (tremolo).
+    fn apply_amp_lfo<Gen, Sample>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, Sample>
+    where
+        Sample: SIMDSample<S>,
+        SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
+        Gen: SIMDVoiceGenerator<S, Sample>,
+    {
+        let lfo = SIMDVoiceLfoAmp::<S>::new(
+            self.amp_lfo_freq, self.amp_lfo_depth,
+            self.stream_params.sample_rate as f32,
+        );
+        VoiceCombineSIMD::mult(lfo, gen)
     }
 
     /// MOVE FORK: see stereo.rs apply_volume_oncc for design notes.
