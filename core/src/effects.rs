@@ -6,3 +6,5 @@ mod delay;
 pub(crate) use delay::*;
 mod chorus;
 pub(crate) use chorus::*;
+mod phaser;
+pub(crate) use phaser::*;

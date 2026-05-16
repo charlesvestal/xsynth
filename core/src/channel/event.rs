@@ -91,6 +91,21 @@ pub enum ChannelConfigEvent {
     SetChorusDepth(f32),
     /// MOVE FORK / Phase 12: dry/wet mix (crossfade, 0..1).
     SetChorusMix(f32),
+
+    /// MOVE FORK / Phase 12: install/remove stereo phaser. Some =
+    /// install with (rate, depth, feedback); None = remove.
+    SetPhaser(Option<(f32, f32, f32)>),
+    SetPhaserRate(f32),
+    SetPhaserDepth(f32),
+    SetPhaserFeedback(f32),
+    /// FX_MIX (crossfade, 0..1).
+    SetPhaserMix(f32),
+
+    /// MOVE FORK / Phase 13: channel-level M/S stereo widener. `width`
+    /// scales the side signal: 1.0 = unchanged, 0.0 = mono, 2.0 =
+    /// exaggerated. Default 1.0 — channel skips processing when width
+    /// is within 1e-3 of unity.
+    SetWidener(f32),
 }
 
 /// MIDI events for a channel.

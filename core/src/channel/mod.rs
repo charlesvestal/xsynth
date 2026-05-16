@@ -195,6 +195,13 @@ pub struct VoiceChannel {
     /// short delays. `chorus_mix` is crossfade (DS FX_MIX convention).
     chorus: Option<crate::effects::StereoChorus>,
     chorus_mix: f32,
+    /// MOVE FORK / Phase 12: stereo phaser (fundsp allpass cascade).
+    /// `phaser_mix` is crossfade (DS FX_MIX convention).
+    phaser: Option<crate::effects::StereoPhaser>,
+    phaser_mix: f32,
+    /// MOVE FORK / Phase 13: M/S stereo widener `side` scale. 1.0 =
+    /// unchanged (no-op); processed inline when |width-1| > 1e-3.
+    widener: f32,
 }
 
 impl VoiceChannel {
@@ -252,6 +259,9 @@ impl VoiceChannel {
             delay_mix: 0.0,
             chorus: None,
             chorus_mix: 0.0,
+            phaser: None,
+            phaser_mix: 0.0,
+            widener: 1.0,
         }
     }
 
@@ -358,6 +368,34 @@ impl VoiceChannel {
                         sample[0] = wl;
                         sample[1] = wr;
                     }
+                }
+            }
+        }
+
+        // MOVE FORK / Phase 12: stereo phaser. Same crossfade convention.
+        if self.phaser_mix > 0.0 {
+            if let Some(phaser) = self.phaser.as_mut() {
+                if let ChannelCount::Stereo = self.stream_params.channels {
+                    for sample in out.chunks_mut(2) {
+                        let (wl, wr) = phaser.process(sample[0], sample[1]);
+                        sample[0] = wl;
+                        sample[1] = wr;
+                    }
+                }
+            }
+        }
+
+        // MOVE FORK / Phase 13: M/S stereo widener. width=1 → no-op
+        // (cheap skip); else scale side signal by width.
+        if (self.widener - 1.0).abs() > 1e-3 {
+            if let ChannelCount::Stereo = self.stream_params.channels {
+                let w = self.widener;
+                for sample in out.chunks_mut(2) {
+                    let mid  = 0.5 * (sample[0] + sample[1]);
+                    let side = 0.5 * (sample[0] - sample[1]);
+                    let side = side * w;
+                    sample[0] = mid + side;
+                    sample[1] = mid - side;
                 }
             }
         }
@@ -644,6 +682,35 @@ impl VoiceChannel {
                             self.chorus_mix = m.clamp(0.0, 1.0);
                             if let Some(c) = self.chorus.as_mut() { c.set_mix(m); }
                         }
+                        ChannelConfigEvent::SetPhaser(params) => {
+                            if let Some((rate, depth, fb)) = params {
+                                let mut p = crate::effects::StereoPhaser::new(
+                                    self.stream_params.sample_rate as f32,
+                                );
+                                p.set_rate(rate);
+                                p.set_depth(depth);
+                                p.set_feedback(fb);
+                                self.phaser = Some(p);
+                            } else {
+                                self.phaser = None;
+                            }
+                        }
+                        ChannelConfigEvent::SetPhaserRate(r) => {
+                            if let Some(p) = self.phaser.as_mut() { p.set_rate(r); }
+                        }
+                        ChannelConfigEvent::SetPhaserDepth(d) => {
+                            if let Some(p) = self.phaser.as_mut() { p.set_depth(d); }
+                        }
+                        ChannelConfigEvent::SetPhaserFeedback(f) => {
+                            if let Some(p) = self.phaser.as_mut() { p.set_feedback(f); }
+                        }
+                        ChannelConfigEvent::SetPhaserMix(m) => {
+                            self.phaser_mix = m.clamp(0.0, 1.0);
+                            if let Some(p) = self.phaser.as_mut() { p.set_mix(m); }
+                        }
+                        ChannelConfigEvent::SetWidener(w) => {
+                            self.widener = w.clamp(0.0, 4.0);
+                        }
                         other => self.params.process_config_event(other),
                     }
                 }
@@ -692,6 +759,9 @@ impl VoiceChannel {
         }
         // Chorus has a tiny tail (~30ms) — keep rendering while wet.
         if self.chorus_mix > 0.0 && self.chorus.is_some() {
+            return true;
+        }
+        if self.phaser_mix > 0.0 && self.phaser.is_some() {
             return true;
         }
         false

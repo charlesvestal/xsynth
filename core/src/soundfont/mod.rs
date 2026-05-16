@@ -139,6 +139,22 @@ struct SampleVoiceSpawnerParams {
     fil_lfo_depth: f32,
     fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
     fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK / Phase 11: pan LFO (pan sine, depth percent).
+    pan_lfo_freq: f32,
+    pan_lfo_depth: f32,
+    pan_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    pan_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    /// MOVE FORK / Phase 11: filter envelope (autowah). depth cents at peak.
+    fileg_attack: f32,
+    fileg_decay: f32,
+    fileg_sustain: f32,
+    fileg_release: f32,
+    fileg_depth: f32,
+    /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
+    pitch_lfo_freq: f32,
+    pitch_lfo_depth: f32,
+    pitch_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    pitch_lfo_depth_oncc: Arc<[(u8, f32)]>,
 }
 
 pub(super) struct SoundfontInstrument {
@@ -524,6 +540,19 @@ impl SampleSoundfont {
                         fil_lfo_depth: region.fil_lfo_depth,
                         fil_lfo_freq_oncc: region.fil_lfo_freq_oncc.clone().into(),
                         fil_lfo_depth_oncc: region.fil_lfo_depth_oncc.clone().into(),
+                        pan_lfo_freq: region.pan_lfo_freq,
+                        pan_lfo_depth: region.pan_lfo_depth,
+                        pan_lfo_freq_oncc: region.pan_lfo_freq_oncc.clone().into(),
+                        pan_lfo_depth_oncc: region.pan_lfo_depth_oncc.clone().into(),
+                        fileg_attack:  region.fileg_attack,
+                        fileg_decay:   region.fileg_decay,
+                        fileg_sustain: region.fileg_sustain,
+                        fileg_release: region.fileg_release,
+                        fileg_depth:   region.fileg_depth,
+                        pitch_lfo_freq:  region.pitch_lfo_freq,
+                        pitch_lfo_depth: region.pitch_lfo_depth,
+                        pitch_lfo_freq_oncc:  region.pitch_lfo_freq_oncc.clone().into(),
+                        pitch_lfo_depth_oncc: region.pitch_lfo_depth_oncc.clone().into(),
                     });
 
                     // MOVE FORK: track max seq_length seen at this slot
@@ -720,6 +749,19 @@ impl SampleSoundfont {
                             fil_lfo_depth: 0.0,
                             fil_lfo_freq_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                             fil_lfo_depth_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            pan_lfo_freq: 0.0,
+                            pan_lfo_depth: 0.0,
+                            pan_lfo_freq_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            pan_lfo_depth_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            fileg_attack: 0.0,
+                            fileg_decay: 0.0,
+                            fileg_sustain: 1.0,
+                            fileg_release: 0.0,
+                            fileg_depth: 0.0,
+                            pitch_lfo_freq: 0.0,
+                            pitch_lfo_depth: 0.0,
+                            pitch_lfo_freq_oncc: Arc::from(Vec::<(u8, f32)>::new()),
+                            pitch_lfo_depth_oncc: Arc::from(Vec::<(u8, f32)>::new()),
                         });
 
                         spawner_params_list[index].push(spawner_params.clone());

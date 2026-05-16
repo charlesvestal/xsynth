@@ -98,7 +98,13 @@ impl VoiceChannelParams {
             | ChannelConfigEvent::SetChorus(_)
             | ChannelConfigEvent::SetChorusRate(_)
             | ChannelConfigEvent::SetChorusDepth(_)
-            | ChannelConfigEvent::SetChorusMix(_) => {}
+            | ChannelConfigEvent::SetChorusMix(_)
+            | ChannelConfigEvent::SetPhaser(_)
+            | ChannelConfigEvent::SetPhaserRate(_)
+            | ChannelConfigEvent::SetPhaserDepth(_)
+            | ChannelConfigEvent::SetPhaserFeedback(_)
+            | ChannelConfigEvent::SetPhaserMix(_)
+            | ChannelConfigEvent::SetWidener(_) => {}
         }
     }
 

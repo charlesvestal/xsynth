@@ -42,6 +42,9 @@ pub(crate) use pan_oncc::*;
 mod lfo;
 pub(crate) use lfo::*;
 
+mod lfo_pitch;
+pub(crate) use lfo_pitch::*;
+
 /// MOVE FORK: per-channel raw MIDI CC array. Updated by the channel
 /// every `ControlEvent::Raw(cc, val)`. Voices clone the `Arc` at spawn
 /// time and live `_oncc` generators (e.g. SIMDVoiceOnccAmp in a later

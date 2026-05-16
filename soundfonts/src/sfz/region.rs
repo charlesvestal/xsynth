@@ -101,6 +101,24 @@ pub(crate) struct RegionParamsBuilder {
     fil_lfo_depth: f32,
     fil_lfo_freq_oncc: Vec<(u8, f32)>,
     fil_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: pan LFO. depth in percent (-100..100).
+    /// SIMDVoicePan adds `sin(phase) * depth / 100` into pan ∈ [-1, 1].
+    pan_lfo_freq: f32,
+    pan_lfo_depth: f32,
+    pan_lfo_freq_oncc: Vec<(u8, f32)>,
+    pan_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: filter envelope (ADSR autowah). depth in
+    /// cents added to filter cutoff at envelope peak.
+    fileg_attack: f32,
+    fileg_decay: f32,
+    fileg_sustain: f32,
+    fileg_release: f32,
+    fileg_depth: f32,
+    /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
+    pitch_lfo_freq: f32,
+    pitch_lfo_depth: f32,
+    pitch_lfo_freq_oncc: Vec<(u8, f32)>,
+    pitch_lfo_depth_oncc: Vec<(u8, f32)>,
     offset: u32,
     cutoff: Option<f32>,
     resonance: f32,
@@ -173,6 +191,19 @@ impl Default for RegionParamsBuilder {
             fil_lfo_depth: 0.0,
             fil_lfo_freq_oncc: Vec::new(),
             fil_lfo_depth_oncc: Vec::new(),
+            pan_lfo_freq: 0.0,
+            pan_lfo_depth: 0.0,
+            pan_lfo_freq_oncc: Vec::new(),
+            pan_lfo_depth_oncc: Vec::new(),
+            fileg_attack: 0.0,
+            fileg_decay: 0.0,
+            fileg_sustain: 1.0,
+            fileg_release: 0.0,
+            fileg_depth: 0.0,
+            pitch_lfo_freq: 0.0,
+            pitch_lfo_depth: 0.0,
+            pitch_lfo_freq_oncc: Vec::new(),
+            pitch_lfo_depth_oncc: Vec::new(),
             offset: 0,
             cutoff: None,
             resonance: 0.0,
@@ -254,6 +285,43 @@ impl RegionParamsBuilder {
                     existing.1 = v;
                 } else {
                     self.amp_lfo_depth_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::PanLfoFreq(val) => self.pan_lfo_freq = val,
+            SfzOpcode::PanLfoDepth(val) => self.pan_lfo_depth = val,
+            SfzOpcode::PanLfoFreqOncc(cc, v) => {
+                if let Some(existing) = self.pan_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.pan_lfo_freq_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::PanLfoDepthOncc(cc, v) => {
+                if let Some(existing) = self.pan_lfo_depth_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.pan_lfo_depth_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::FilegAttack(v)  => self.fileg_attack  = v,
+            SfzOpcode::FilegDecay(v)   => self.fileg_decay   = v,
+            SfzOpcode::FilegSustain(v) => self.fileg_sustain = v,
+            SfzOpcode::FilegRelease(v) => self.fileg_release = v,
+            SfzOpcode::FilegDepth(v)   => self.fileg_depth   = v,
+            SfzOpcode::PitchLfoFreq(v)  => self.pitch_lfo_freq  = v,
+            SfzOpcode::PitchLfoDepth(v) => self.pitch_lfo_depth = v,
+            SfzOpcode::PitchLfoFreqOncc(cc, v) => {
+                if let Some(existing) = self.pitch_lfo_freq_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.pitch_lfo_freq_oncc.push((cc, v));
+                }
+            }
+            SfzOpcode::PitchLfoDepthOncc(cc, v) => {
+                if let Some(existing) = self.pitch_lfo_depth_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = v;
+                } else {
+                    self.pitch_lfo_depth_oncc.push((cc, v));
                 }
             }
             SfzOpcode::Offset(val) => self.offset = val,
@@ -411,6 +479,19 @@ impl RegionParamsBuilder {
             fil_lfo_depth: self.fil_lfo_depth,
             fil_lfo_freq_oncc: self.fil_lfo_freq_oncc,
             fil_lfo_depth_oncc: self.fil_lfo_depth_oncc,
+            pan_lfo_freq: self.pan_lfo_freq,
+            pan_lfo_depth: self.pan_lfo_depth,
+            pan_lfo_freq_oncc: self.pan_lfo_freq_oncc,
+            pan_lfo_depth_oncc: self.pan_lfo_depth_oncc,
+            fileg_attack: self.fileg_attack,
+            fileg_decay: self.fileg_decay,
+            fileg_sustain: self.fileg_sustain,
+            fileg_release: self.fileg_release,
+            fileg_depth: self.fileg_depth,
+            pitch_lfo_freq: self.pitch_lfo_freq,
+            pitch_lfo_depth: self.pitch_lfo_depth,
+            pitch_lfo_freq_oncc: self.pitch_lfo_freq_oncc,
+            pitch_lfo_depth_oncc: self.pitch_lfo_depth_oncc,
             offset: self.offset,
             cutoff: self.cutoff,
             resonance: self.resonance,
@@ -468,6 +549,24 @@ pub struct RegionParams {
     pub fil_lfo_depth: f32,
     pub fil_lfo_freq_oncc: Vec<(u8, f32)>,
     pub fil_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: pan LFO (sine on pan, depth in percent).
+    pub pan_lfo_freq: f32,
+    pub pan_lfo_depth: f32,
+    pub pan_lfo_freq_oncc: Vec<(u8, f32)>,
+    pub pan_lfo_depth_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / Phase 11: filter ADSR routed to cutoff cents
+    /// (autowah). Depth = full-swing cents at peak.
+    pub fileg_attack: f32,
+    pub fileg_decay: f32,
+    pub fileg_sustain: f32,
+    pub fileg_release: f32,
+    pub fileg_depth: f32,
+    /// MOVE FORK / Phase 11: pitch LFO (vibrato) — sine multiplier
+    /// into voice pitch_fac, depth in cents.
+    pub pitch_lfo_freq: f32,
+    pub pitch_lfo_depth: f32,
+    pub pitch_lfo_freq_oncc: Vec<(u8, f32)>,
+    pub pitch_lfo_depth_oncc: Vec<(u8, f32)>,
     pub offset: u32,
     pub cutoff: Option<f32>,
     pub resonance: f32,

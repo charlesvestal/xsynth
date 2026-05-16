@@ -62,6 +62,17 @@ struct LiveCutoffState {
     fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
     /// Running phase in radians.
     lfo_phase: f32,
+    /// MOVE FORK / Phase 11: filter envelope (autowah). Times in
+    /// seconds, depth in cents added at peak; advanced one tick at a
+    /// time inside step(). `fileg_released` flips on signal_release().
+    fileg_attack: f32,
+    fileg_decay: f32,
+    fileg_sustain: f32,
+    fileg_release: f32,
+    fileg_depth: f32,
+    fileg_stage: u8,    // 0=A 1=D 2=S 3=R 4=done
+    fileg_level: f32,   // current 0..1
+    fileg_released: bool,
     fil_type: FilterType,
     sample_rate: f32,
     base_freq: f32,
@@ -89,6 +100,11 @@ impl LiveCutoffState {
         fil_lfo_depth: f32,
         fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
         fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+        fileg_attack: f32,
+        fileg_decay: f32,
+        fileg_sustain: f32,
+        fileg_release: f32,
+        fileg_depth: f32,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -98,8 +114,9 @@ impl LiveCutoffState {
         let max_lfo_depth_delta: f32 = fil_lfo_depth_oncc.iter().map(|(_, d)| d.abs()).sum();
         let has_lfo = (fil_lfo_freq + max_lfo_freq_delta) > 0.0
             && (fil_lfo_depth + max_lfo_depth_delta) > 0.0;
+        let has_fileg = fileg_depth.abs() > 0.0;
         let static_filter = cutoff_oncc.is_empty() && resonance_oncc.is_empty()
-            && !has_lfo;
+            && !has_lfo && !has_fileg;
         // 10ms smoothing time constant. tick_samples = RECOMPUTE_INTERVAL
         // * a SIMD vector width (assume 4 for aarch64 NEON; the exact
         // value isn't critical — alpha just controls smoothing speed,
@@ -121,6 +138,14 @@ impl LiveCutoffState {
             fil_lfo_freq_oncc,
             fil_lfo_depth_oncc,
             lfo_phase: 0.0,
+            fileg_attack,
+            fileg_decay,
+            fileg_sustain,
+            fileg_release,
+            fileg_depth,
+            fileg_stage: 0,
+            fileg_level: 0.0,
+            fileg_released: false,
             fil_type,
             sample_rate,
             base_freq,
@@ -131,6 +156,11 @@ impl LiveCutoffState {
             static_filter,
             countdown: 0,
         }
+    }
+
+    /// MOVE FORK / Phase 11: forward note-off into the filter envelope.
+    fn notify_release(&mut self) {
+        self.fileg_released = true;
     }
 
     /// Target (freq, Q) from the live CC state + filter LFO.
@@ -166,6 +196,53 @@ impl LiveCutoffState {
                 self.lfo_phase -= 2.0 * std::f32::consts::PI;
             }
             cents_sum += self.lfo_phase.sin() * lfo_depth;
+        }
+        // MOVE FORK / Phase 11: filter envelope (autowah). Advances
+        // one tick (~32 samples) at a time. Stage transitions when the
+        // current ramp hits its target. `release` jumps the stage to R
+        // as soon as fileg_released is set.
+        if self.fileg_depth.abs() > 0.0 {
+            let tick_secs = (RECOMPUTE_INTERVAL as f32 * 4.0) / self.sample_rate;
+            if self.fileg_released && self.fileg_stage < 3 {
+                self.fileg_stage = 3;
+            }
+            match self.fileg_stage {
+                0 => {
+                    let rate = if self.fileg_attack > 0.0 {
+                        tick_secs / self.fileg_attack
+                    } else { 1.0 };
+                    self.fileg_level += rate;
+                    if self.fileg_level >= 1.0 {
+                        self.fileg_level = 1.0;
+                        self.fileg_stage = 1;
+                    }
+                }
+                1 => {
+                    let rate = if self.fileg_decay > 0.0 {
+                        tick_secs / self.fileg_decay
+                    } else { 1.0 };
+                    self.fileg_level -= rate * (1.0 - self.fileg_sustain);
+                    if self.fileg_level <= self.fileg_sustain {
+                        self.fileg_level = self.fileg_sustain;
+                        self.fileg_stage = 2;
+                    }
+                }
+                2 => {
+                    // Sustain — hold level.
+                }
+                3 => {
+                    let rate = if self.fileg_release > 0.0 {
+                        tick_secs / self.fileg_release
+                    } else { 1.0 };
+                    self.fileg_level -= rate;
+                    if self.fileg_level <= 0.0 {
+                        self.fileg_level = 0.0;
+                        self.fileg_stage = 4;
+                    }
+                }
+                _ => {}
+            }
+            cents_sum += self.fileg_level * self.fileg_depth;
         }
         let mut db_sum = self.base_resonance_db;
         for (cc, delta) in self.resonance_oncc.iter() {
@@ -362,6 +439,11 @@ where
         fil_lfo_depth: f32,
         fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
         fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+        fileg_attack: f32,
+        fileg_decay: f32,
+        fileg_sustain: f32,
+        fileg_release: f32,
+        fileg_depth: f32,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -381,6 +463,11 @@ where
                 fil_lfo_depth,
                 fil_lfo_freq_oncc,
                 fil_lfo_depth_oncc,
+                fileg_attack,
+                fileg_decay,
+                fileg_sustain,
+                fileg_release,
+                fileg_depth,
                 fil_type,
                 sample_rate,
                 base_freq,
@@ -399,7 +486,10 @@ where
     #[inline(always)]
     fn ended(&self) -> bool { self.v.ended() }
     #[inline(always)]
-    fn signal_release(&mut self, rel_type: ReleaseType) { self.v.signal_release(rel_type); }
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        self.state.notify_release();
+        self.v.signal_release(rel_type);
+    }
     #[inline(always)]
     fn process_controls(&mut self, control: &VoiceControlData) { self.v.process_controls(control); }
 }
@@ -457,6 +547,11 @@ where
         fil_lfo_depth: f32,
         fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
         fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+        fileg_attack: f32,
+        fileg_decay: f32,
+        fileg_sustain: f32,
+        fileg_release: f32,
+        fileg_depth: f32,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -477,6 +572,11 @@ where
                 fil_lfo_depth,
                 fil_lfo_freq_oncc,
                 fil_lfo_depth_oncc,
+                fileg_attack,
+                fileg_decay,
+                fileg_sustain,
+                fileg_release,
+                fileg_depth,
                 fil_type,
                 sample_rate,
                 base_freq,
@@ -495,7 +595,10 @@ where
     #[inline(always)]
     fn ended(&self) -> bool { self.v.ended() }
     #[inline(always)]
-    fn signal_release(&mut self, rel_type: ReleaseType) { self.v.signal_release(rel_type); }
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        self.state.notify_release();
+        self.v.signal_release(rel_type);
+    }
     #[inline(always)]
     fn process_controls(&mut self, control: &VoiceControlData) { self.v.process_controls(control); }
 }

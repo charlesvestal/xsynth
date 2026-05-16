@@ -52,6 +52,25 @@ pub enum SfzOpcode {
     FilLfoDepth(f32),
     FilLfoFreqOncc(u8, f32),
     FilLfoDepthOncc(u8, f32),
+    /// MOVE FORK / Phase 11: SFZ `panlfo_freq` (Hz) + `panlfo_depth`
+    /// (-100..100 = full L/R sweep). Sine LFO modulating voice pan.
+    PanLfoFreq(f32),
+    PanLfoDepth(f32),
+    PanLfoFreqOncc(u8, f32),
+    PanLfoDepthOncc(u8, f32),
+    /// MOVE FORK / Phase 11: filter envelope (autowah). ADSR routed
+    /// into cutoff cents — `fileg_depth` is the full-swing cents added
+    /// at envelope peak.
+    FilegAttack(f32),
+    FilegDecay(f32),
+    FilegSustain(f32),
+    FilegRelease(f32),
+    FilegDepth(f32),
+    /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
+    PitchLfoFreq(f32),
+    PitchLfoDepth(f32),
+    PitchLfoFreqOncc(u8, f32),
+    PitchLfoDepthOncc(u8, f32),
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
@@ -444,6 +463,30 @@ fn parse_sfz_opcode(
                 }
                 return Ok(None);
             }
+            if base_name == "panlfo_freq" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(PanLfoFreqOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "panlfo_depth" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(PanLfoDepthOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "pitchlfo_freq" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(PitchLfoFreqOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            if base_name == "pitchlfo_depth" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(PitchLfoDepthOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
             let base = match base_name {
                 "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
                 "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
@@ -531,6 +574,15 @@ fn parse_sfz_opcode(
         "amplfo_depth" => val.parse::<f32>().ok().map(AmpLfoDepth),
         "fillfo_freq" => val.parse::<f32>().ok().map(FilLfoFreq),
         "fillfo_depth" => val.parse::<f32>().ok().map(FilLfoDepth),
+        "panlfo_freq" => val.parse::<f32>().ok().map(PanLfoFreq),
+        "panlfo_depth" => val.parse::<f32>().ok().map(PanLfoDepth),
+        "fileg_attack"  => val.parse::<f32>().ok().map(FilegAttack),
+        "fileg_decay"   => val.parse::<f32>().ok().map(FilegDecay),
+        "fileg_sustain" => val.parse::<f32>().ok().map(FilegSustain),
+        "fileg_release" => val.parse::<f32>().ok().map(FilegRelease),
+        "fileg_depth"   => val.parse::<f32>().ok().map(FilegDepth),
+        "pitchlfo_freq"  => val.parse::<f32>().ok().map(PitchLfoFreq),
+        "pitchlfo_depth" => val.parse::<f32>().ok().map(PitchLfoDepth),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
         "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),

@@ -15,7 +15,7 @@ use crate::{
     voice::{
         BufferSamplers, CcState, EnvelopeParameters, SIMDConstant,
         SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
-        SIMDVoiceControl, SIMDVoiceEnvelope, SIMDVoiceLfoAmp, SIMDVoiceOnccAmp, SIMDVoicePan, SampleReader,
+        SIMDVoiceControl, SIMDVoiceEnvelope, SIMDVoiceLfoAmp, SIMDVoiceLfoPitch, SIMDVoiceOnccAmp, SIMDVoicePan, SampleReader,
         SampleReaderLoop, SampleReaderLoopSustain, SampleReaderNoLoop, Voice, VoiceBase,
         VoiceCombineSIMD,
     },
@@ -70,6 +70,19 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     fil_lfo_depth: f32,
     fil_lfo_freq_oncc: Arc<[(u8, f32)]>,
     fil_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    pan_lfo_freq: f32,
+    pan_lfo_depth: f32,
+    pan_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    pan_lfo_depth_oncc: Arc<[(u8, f32)]>,
+    fileg_attack: f32,
+    fileg_decay: f32,
+    fileg_sustain: f32,
+    fileg_release: f32,
+    fileg_depth: f32,
+    pitch_lfo_freq: f32,
+    pitch_lfo_depth: f32,
+    pitch_lfo_freq_oncc: Arc<[(u8, f32)]>,
+    pitch_lfo_depth_oncc: Arc<[(u8, f32)]>,
     _s: PhantomData<S>,
 }
 
@@ -122,6 +135,19 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             fil_lfo_depth: params.fil_lfo_depth,
             fil_lfo_freq_oncc: params.fil_lfo_freq_oncc.clone(),
             fil_lfo_depth_oncc: params.fil_lfo_depth_oncc.clone(),
+            pan_lfo_freq: params.pan_lfo_freq,
+            pan_lfo_depth: params.pan_lfo_depth,
+            pan_lfo_freq_oncc: params.pan_lfo_freq_oncc.clone(),
+            pan_lfo_depth_oncc: params.pan_lfo_depth_oncc.clone(),
+            fileg_attack:  params.fileg_attack,
+            fileg_decay:   params.fileg_decay,
+            fileg_sustain: params.fileg_sustain,
+            fileg_release: params.fileg_release,
+            fileg_depth:   params.fileg_depth,
+            pitch_lfo_freq:  params.pitch_lfo_freq,
+            pitch_lfo_depth: params.pitch_lfo_depth,
+            pitch_lfo_freq_oncc:  params.pitch_lfo_freq_oncc.clone(),
+            pitch_lfo_depth_oncc: params.pitch_lfo_depth_oncc.clone(),
             _s: PhantomData,
         }
     }
@@ -176,7 +202,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let left = make_sampler(self.samples[0].clone());
         let right = make_sampler(self.samples[1].clone());
 
-        let pitch_fac = self.create_pitch_fac(control);
+        let pitch_fac = self.create_pitch_fac(control, cc_state);
 
         let sampler = SIMDStereoVoiceSampler::new(left, right, pitch_fac);
         self.apply_voice_params(sampler, control, cc_state)
@@ -210,6 +236,11 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             self.pan_curvecc.clone(),
             self.curves.clone(),
             self.pan,
+            self.stream_params.sample_rate as f32,
+            self.pan_lfo_freq,
+            self.pan_lfo_depth,
+            self.pan_lfo_freq_oncc.clone(),
+            self.pan_lfo_depth_oncc.clone(),
         );
         VoiceCombineSIMD::mult(pan_gen, gen)
     }
@@ -217,11 +248,22 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     fn create_pitch_fac(
         &self,
         control: &VoiceControlData,
+        cc_state: &CcState,
     ) -> impl SIMDVoiceGenerator<S, SIMDSampleMono<S>> {
         let pitch_fac = SIMDConstant::<S>::new(self.speed_mult);
         let pitch_multiplier = SIMDVoiceControl::new(control, |vc| vc.voice_pitch_multiplier);
         let pitch_fac = VoiceCombineSIMD::mult(pitch_fac, pitch_multiplier);
-        pitch_fac
+        // MOVE FORK / Phase 11: pitch LFO (vibrato). Multiplies a
+        // sin-modulated cents factor into the read-rate.
+        let pitch_lfo = SIMDVoiceLfoPitch::<S>::new(
+            cc_state.clone(),
+            self.pitch_lfo_freq,
+            self.pitch_lfo_depth,
+            self.stream_params.sample_rate as f32,
+            self.pitch_lfo_freq_oncc.clone(),
+            self.pitch_lfo_depth_oncc.clone(),
+        );
+        VoiceCombineSIMD::mult(pitch_fac, pitch_lfo)
     }
 
     fn apply_envelope<Gen, Sample>(
@@ -353,6 +395,11 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
                 self.fil_lfo_depth,
                 self.fil_lfo_freq_oncc.clone(),
                 self.fil_lfo_depth_oncc.clone(),
+                self.fileg_attack,
+                self.fileg_decay,
+                self.fileg_sustain,
+                self.fileg_release,
+                self.fileg_depth,
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,
