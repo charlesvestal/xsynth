@@ -133,7 +133,7 @@ impl LiveCutoffState {
         let smooth_samples = sample_rate * 0.010;
         let smooth_alpha = 1.0 - (-tick_samples / smooth_samples).exp();
         let init_q = db_to_amp(base_resonance_db) * Q_BUTTERWORTH_F32;
-        Self {
+        let mut s = Self {
             cc_state,
             cutoff_oncc,
             resonance_oncc,
@@ -163,7 +163,28 @@ impl LiveCutoffState {
             smooth_alpha,
             static_filter,
             countdown: 0,
+        };
+        // MOVE FORK / 2026-05-16: snap current freq/Q to the live CC
+        // target on construction. Otherwise every voice spawn starts
+        // the filter at the SFZ static cutoff= / resonance= base
+        // (which our converter writes as knob_min — typically near
+        // silence) and smooths it toward the CC-resolved target over
+        // ~45 ms, producing an audible filter-envelope sweep on each
+        // note-on that doesn't exist in DS. K4-Acoustic surfaced this:
+        // the cutoff knob's `value=22000` only takes effect via CC,
+        // so without this snap the filter starts at 1 Hz and rings
+        // open during voice attack. Skip when static_filter (no oncc
+        // bindings → nothing to chase) so existing static-filter
+        // behavior is unchanged.
+        if !s.static_filter {
+            let (tf, tq) = s.target();
+            s.current_freq = tf;
+            s.current_q = tq;
+            // target() advanced lfo_phase by one tick; rewind so the
+            // first audio tick starts at phase 0 like before.
+            s.lfo_phase = 0.0;
         }
+        s
     }
 
     /// MOVE FORK / Phase 11: forward note-off into the filter envelope.

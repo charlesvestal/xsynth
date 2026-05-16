@@ -28,6 +28,23 @@ impl BiQuadFilter {
             None => Q_BUTTERWORTH_F32,
         };
         let freq = sanitize_freq(freq, sample_rate);
+        // MOVE FORK / 2026-05-16: roll Q toward Butterworth as cutoff
+        // approaches Nyquist. The bilinear-transform biquad keeps full
+        // Q all the way to the sanitize clamp (0.45·sr), but DS's
+        // filter (measured via impulse response at cutoff ∈ {2k, 16k,
+        // 20k} with ds_res=2) has Q decay following ≈ 1 - 2·(fc/sr)².
+        // Without this compensation, presets with a wide-open cutoff
+        // + high authored Q (K4-Acoustic defaults to cutoff=22k,
+        // res=2) sparkle / blow out near Nyquist because the peak
+        // sits in the audible top end at full +6 dB. Only a tiny
+        // safety floor (0.01) to keep the biquad coefficients finite
+        // when an author sets Q ≈ 0 — preserving the user's intent
+        // for heavily damped filters at low knob positions.
+        let q = {
+            let fc_ratio = freq / sample_rate;
+            let factor = (1.0 - 2.0 * fc_ratio * fc_ratio).max(0.5);
+            (q * factor).max(0.01)
+        };
 
         match fil_type {
             FilterType::LowPass => {
