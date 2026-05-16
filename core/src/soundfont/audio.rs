@@ -71,17 +71,31 @@ fn try_mmap_cache(
     let bytes_per_chan = frames * 2;
     if mmap.len() < CACHE_HEADER_BYTES + n_chans * bytes_per_chan { return None; }
 
-    let holder = Arc::new(MmapHolder { mmap });
-    // Hint the kernel that page-access is sparse: most samples sit cold,
-    // pages get hot only while a specific note is sustaining.
-    holder.advise_random();
+    // MOVE FORK / 2026-05-16: copy the cache into a heap-backed Vec<i16>
+    // and drop the mmap. The OS could evict mmap pages under memory
+    // pressure, faulting them back in on the audio thread (~100 ms+
+    // spikes seen on Move with the rhodes preset). Heap allocations are
+    // never evicted, so audio rendering is fault-free at the cost of
+    // ~src_size bytes of RAM that don't get to ride disk cache.
     let channels: Vec<Arc<SampleStorage>> = (0..n_chans).map(|c| {
-        Arc::new(SampleStorage::from_mmap(
-            holder.clone(),
-            CACHE_HEADER_BYTES + c * bytes_per_chan,
-            frames,
-        ))
+        let start = CACHE_HEADER_BYTES + c * bytes_per_chan;
+        let end   = start + bytes_per_chan;
+        // SAFETY: cache header validated above so we're inside `mmap`.
+        // i16 is POD; bytes here are the raw little-endian sample data.
+        let src: &[u8] = &mmap[start..end];
+        let mut buf: Vec<i16> = Vec::with_capacity(frames);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr() as *const i16,
+                buf.as_mut_ptr(),
+                frames,
+            );
+            buf.set_len(frames);
+        }
+        Arc::new(SampleStorage::from_heap(Arc::from(buf.into_boxed_slice())))
     }).collect();
+    // mmap drops here — pages can be reclaimed by the OS immediately.
+    drop(mmap);
     Some((channels.into(), src_rate))
 }
 

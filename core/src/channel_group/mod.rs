@@ -166,6 +166,22 @@ impl ChannelGroup {
         self.flush_events();
         buffer.fill(0.0);
 
+        // MOVE FORK / 2026-05-16: idle-probe fast path. The host wakes
+        // every ~500 ms with a render_block call to detect self-
+        // generating audio. When all channels report no work — no
+        // voices, no cached events, no FX tail — the per-channel
+        // rayon dispatch + join overhead alone measured 800-1000 µs on
+        // ARM for the "rhodes" preset (vs ~150 µs for lighter
+        // presets). Skipping rayon entirely on idle blocks drops the
+        // probe to a handful of µs (just the has_work scan).
+        let any_work = self.channels.iter().any(|c| c.has_work());
+        if !any_work {
+            for vec in self.sample_cache_vecs.iter_mut() {
+                vec.clear();
+            }
+            return;
+        }
+
         // MOVE FORK: skip channels with no voices and no pending events.
         // SynthFormat::Midi creates 16 channels; with one active SFZ
         // instance only channel 0 carries work, but the original code

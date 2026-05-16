@@ -128,4 +128,29 @@ impl MmapHolder {
     pub fn advise_random(&self) {
         let _ = self.mmap.advise(memmap2::Advice::Random);
     }
+
+    /// MOVE FORK / 2026-05-16: pre-fault all sample pages into RAM at
+    /// load time. Without this, the first NoteOn on each pitch faulted
+    /// pages from disk and a chord could spend 600+ ms in render_block.
+    /// Touching every page here moves the cost off the audio thread.
+    /// The pages stay resident until the kernel evicts under pressure.
+    pub fn prefault(&self) {
+        // MADV_WILLNEED hints the kernel to async-prefetch pages.
+        let _ = self.mmap.advise(memmap2::Advice::WillNeed);
+        // Force-touch one byte per 4 KiB page so any pages the kernel
+        // didn't actually prefetch are paged in synchronously here,
+        // not on the audio thread. The `read_volatile` keeps the
+        // compiler from optimizing the loop away.
+        let bytes = &self.mmap[..];
+        let page = 4096usize;
+        let mut i = 0;
+        let mut acc: u8 = 0;
+        while i < bytes.len() {
+            acc ^= unsafe { std::ptr::read_volatile(&bytes[i]) };
+            i += page;
+        }
+        // Black-hole `acc` so the loop has an observable side effect.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let _ = acc;
+    }
 }

@@ -468,6 +468,28 @@ impl VoiceChannel {
         self.params.load_program();
         self.enforce_polyphony_cap();
 
+        // MOVE FORK / 2026-05-16: idle inner-loop fast path. has_work()
+        // (called by ChannelGroup) returns true while FX is wet so its
+        // tail can decay, but on those blocks all 128 keys typically
+        // have no voices and no events — the par_iter dispatch + per-
+        // key prepare_cache_vec + sum_simd still costs ~400 µs/block.
+        // Serial scan: if every key is empty, zero `out` and jump
+        // straight to apply_channel_effects so the FX tail still runs.
+        let any_key_work = self
+            .key_voices
+            .iter()
+            .any(|k| !k.event_cache.is_empty() || k.data.has_voices());
+        if !any_key_work {
+            out.fill(0.0);
+            LAST_PARALLEL_US.store(0, Ordering::Relaxed);
+            LAST_SUM_US.store(0, Ordering::Relaxed);
+            let t_fx = Instant::now();
+            self.apply_channel_effects(out);
+            LAST_FX_US.store(t_fx.elapsed().as_micros() as u32, Ordering::Relaxed);
+            LAST_TOTAL_US.store(t_total.elapsed().as_micros() as u32, Ordering::Relaxed);
+            return;
+        }
+
         // MOVE FORK: shared spawn-burst budget for this block. When set,
         // worker threads CAS-decrement before processing each NoteOn;
         // any worker that can't claim a slot leaves the remaining events
