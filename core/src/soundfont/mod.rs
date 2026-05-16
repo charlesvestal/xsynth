@@ -471,7 +471,15 @@ impl SampleSoundfont {
                             + vel * (a + aabs) / 2.0
                             + (127.0 - vel) * (aabs - a) / 2.0
                     };
-                    let vol_mult = (vol_vel / 127.0).powi(2);
+                    // MOVE FORK / 2026-05-16: DS uses a purely linear
+                    // velocity → amp curve. Fine-grid probe (vel 1, 5,
+                    // 10, 16, 24, 32, 40, 50, 60, 64, 70, 80, 90, 100,
+                    // 110, 120, 127) showed amp = vel/127 to four
+                    // decimal places at every step. xsynth's SF2-style
+                    // square was wrong for our DS use case; linear
+                    // produces exact DS amp parity when paired with
+                    // amp_veltrack=100 in the converter.
+                    let vol_mult = vol_vel / 127.0;
                     let vol_db_add =
                         (key as f32 - region.amp_keycenter as f32) * region.amp_keytrack;
                     let vol_db = (region.volume as f32 + vol_db_add).clamp(-96.0, 12.0);
