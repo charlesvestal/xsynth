@@ -79,6 +79,9 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     fileg_sustain: f32,
     fileg_release: f32,
     fileg_depth: f32,
+    /// MOVE FORK / 2026-05-16: optional `<curve>` table index for the
+    /// filter envelope (see `RegionParams::fileg_curve`).
+    fileg_curve: Option<u8>,
     pitch_lfo_freq: f32,
     pitch_lfo_depth: f32,
     pitch_lfo_freq_oncc: Arc<[(u8, f32)]>,
@@ -144,6 +147,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             fileg_sustain: params.fileg_sustain,
             fileg_release: params.fileg_release,
             fileg_depth:   params.fileg_depth,
+            fileg_curve:   params.fileg_curve,
             pitch_lfo_freq:  params.pitch_lfo_freq,
             pitch_lfo_depth: params.pitch_lfo_depth,
             pitch_lfo_freq_oncc:  params.pitch_lfo_freq_oncc.clone(),
@@ -400,6 +404,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
                 self.fileg_sustain,
                 self.fileg_release,
                 self.fileg_depth,
+                self.fileg_curve,
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,

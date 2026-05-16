@@ -299,7 +299,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
                 self.fil_lfo_depth_oncc.clone(),
                 // Mono spawner doesn't currently surface fileg; SF2
                 // doesn't use it and SFZ mono is rare for our presets.
-                0.0, 0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0, 0.0, None,
                 self.filter_type,
                 self.stream_params.sample_rate as f32,
                 self.base_cutoff,

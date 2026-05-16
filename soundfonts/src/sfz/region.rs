@@ -114,6 +114,9 @@ pub(crate) struct RegionParamsBuilder {
     fileg_sustain: f32,
     fileg_release: f32,
     fileg_depth: f32,
+    /// MOVE FORK / 2026-05-16: curve id (into <curve> table map) used
+    /// to shape env_level → cents lookup. None = direct multiply.
+    fileg_curve: Option<u8>,
     /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
     pitch_lfo_freq: f32,
     pitch_lfo_depth: f32,
@@ -200,6 +203,7 @@ impl Default for RegionParamsBuilder {
             fileg_sustain: 1.0,
             fileg_release: 0.0,
             fileg_depth: 0.0,
+            fileg_curve: None,
             pitch_lfo_freq: 0.0,
             pitch_lfo_depth: 0.0,
             pitch_lfo_freq_oncc: Vec::new(),
@@ -308,6 +312,7 @@ impl RegionParamsBuilder {
             SfzOpcode::FilegSustain(v) => self.fileg_sustain = v,
             SfzOpcode::FilegRelease(v) => self.fileg_release = v,
             SfzOpcode::FilegDepth(v)   => self.fileg_depth   = v,
+            SfzOpcode::FilegCurve(id)  => self.fileg_curve   = Some(id),
             SfzOpcode::PitchLfoFreq(v)  => self.pitch_lfo_freq  = v,
             SfzOpcode::PitchLfoDepth(v) => self.pitch_lfo_depth = v,
             SfzOpcode::PitchLfoFreqOncc(cc, v) => {
@@ -488,6 +493,7 @@ impl RegionParamsBuilder {
             fileg_sustain: self.fileg_sustain,
             fileg_release: self.fileg_release,
             fileg_depth: self.fileg_depth,
+            fileg_curve: self.fileg_curve,
             pitch_lfo_freq: self.pitch_lfo_freq,
             pitch_lfo_depth: self.pitch_lfo_depth,
             pitch_lfo_freq_oncc: self.pitch_lfo_freq_oncc,
@@ -561,6 +567,13 @@ pub struct RegionParams {
     pub fileg_sustain: f32,
     pub fileg_release: f32,
     pub fileg_depth: f32,
+    /// MOVE FORK / 2026-05-16: optional curve table index for the filter
+    /// envelope. When set, LiveCutoffState uses `curves[id][env_level*127]`
+    /// as a 0..1 multiplier on `fileg_depth` instead of feeding env_level
+    /// directly into the exponential cents domain. Lets DS's
+    /// `<envelope translation="linear">` (linear-Hz sweep) be pre-baked
+    /// into the SFZ exp-cents pipeline.
+    pub fileg_curve: Option<u8>,
     /// MOVE FORK / Phase 11: pitch LFO (vibrato) — sine multiplier
     /// into voice pitch_fac, depth in cents.
     pub pitch_lfo_freq: f32,

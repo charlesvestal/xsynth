@@ -150,6 +150,12 @@ struct SampleVoiceSpawnerParams {
     fileg_sustain: f32,
     fileg_release: f32,
     fileg_depth: f32,
+    /// MOVE FORK / 2026-05-16: optional `<curve>` table index for the
+    /// filter envelope. When Some, LiveCutoffState uses
+    /// `curves[id][env_level*127]` as a 0..1 multiplier on `fileg_depth`,
+    /// so the converter can pre-bake DS's linear-Hz envelope sweep into
+    /// the exp-cents domain.
+    fileg_curve: Option<u8>,
     /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
     pitch_lfo_freq: f32,
     pitch_lfo_depth: f32,
@@ -549,6 +555,7 @@ impl SampleSoundfont {
                         fileg_sustain: region.fileg_sustain,
                         fileg_release: region.fileg_release,
                         fileg_depth:   region.fileg_depth,
+                        fileg_curve:   region.fileg_curve,
                         pitch_lfo_freq:  region.pitch_lfo_freq,
                         pitch_lfo_depth: region.pitch_lfo_depth,
                         pitch_lfo_freq_oncc:  region.pitch_lfo_freq_oncc.clone().into(),
@@ -758,6 +765,7 @@ impl SampleSoundfont {
                             fileg_sustain: 1.0,
                             fileg_release: 0.0,
                             fileg_depth: 0.0,
+                            fileg_curve: None,
                             pitch_lfo_freq: 0.0,
                             pitch_lfo_depth: 0.0,
                             pitch_lfo_freq_oncc: Arc::from(Vec::<(u8, f32)>::new()),

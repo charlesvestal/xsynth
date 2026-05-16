@@ -66,6 +66,14 @@ pub enum SfzOpcode {
     FilegSustain(f32),
     FilegRelease(f32),
     FilegDepth(f32),
+    /// MOVE FORK / 2026-05-16: optional curve table reference for the
+    /// filter envelope. Without it, fileg adds `level * depth` cents
+    /// per sample (exponential cutoff sweep). With it, the
+    /// LiveCutoffState looks up `curve[level * 127]` as a 0..1
+    /// multiplier on depth, so the converter can pre-bake a linear-
+    /// Hz mapping (DS's `<envelope translation="linear">` semantic)
+    /// into an exponential-cents domain.
+    FilegCurve(u8),
     /// MOVE FORK / Phase 11: pitch LFO (vibrato). depth in cents.
     PitchLfoFreq(f32),
     PitchLfoDepth(f32),
@@ -581,6 +589,7 @@ fn parse_sfz_opcode(
         "fileg_sustain" => val.parse::<f32>().ok().map(FilegSustain),
         "fileg_release" => val.parse::<f32>().ok().map(FilegRelease),
         "fileg_depth"   => val.parse::<f32>().ok().map(FilegDepth),
+        "fileg_curve"   => val.parse::<u8>().ok().map(FilegCurve),
         "pitchlfo_freq"  => val.parse::<f32>().ok().map(PitchLfoFreq),
         "pitchlfo_depth" => val.parse::<f32>().ok().map(PitchLfoDepth),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),

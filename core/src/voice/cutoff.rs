@@ -70,6 +70,12 @@ struct LiveCutoffState {
     fileg_sustain: f32,
     fileg_release: f32,
     fileg_depth: f32,
+    /// MOVE FORK / 2026-05-16: optional curve lookup applied to the
+    /// envelope level before multiplying by depth. None = use level
+    /// directly (SFZ-spec exp-cents sweep). Some(id) = use
+    /// `curves[id][round(level*127)]` so DS's `translation="linear"`
+    /// (linear-Hz) envelopes can be pre-baked by the converter.
+    fileg_curve: Option<u8>,
     fileg_stage: u8,    // 0=A 1=D 2=S 3=R 4=done
     fileg_level: f32,   // current 0..1
     fileg_released: bool,
@@ -105,6 +111,7 @@ impl LiveCutoffState {
         fileg_sustain: f32,
         fileg_release: f32,
         fileg_depth: f32,
+        fileg_curve: Option<u8>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -143,6 +150,7 @@ impl LiveCutoffState {
             fileg_sustain,
             fileg_release,
             fileg_depth,
+            fileg_curve,
             fileg_stage: 0,
             fileg_level: 0.0,
             fileg_released: false,
@@ -242,7 +250,21 @@ impl LiveCutoffState {
                 }
                 _ => {}
             }
-            cents_sum += self.fileg_level * self.fileg_depth;
+            // MOVE FORK / 2026-05-16: when `fileg_curve` is set, route
+            // the envelope level through a 128-point curve table before
+            // multiplying by depth. Lets the SFZ converter pre-bake DS's
+            // linear-Hz envelope sweep into the SFZ exp-cents domain.
+            let env = if let Some(id) = self.fileg_curve {
+                if let Some(table) = self.curves.get(&id) {
+                    let idx = (self.fileg_level.clamp(0.0, 1.0) * 127.0).round() as usize;
+                    table[idx.min(127)]
+                } else {
+                    self.fileg_level
+                }
+            } else {
+                self.fileg_level
+            };
+            cents_sum += env * self.fileg_depth;
         }
         let mut db_sum = self.base_resonance_db;
         for (cc, delta) in self.resonance_oncc.iter() {
@@ -444,6 +466,7 @@ where
         fileg_sustain: f32,
         fileg_release: f32,
         fileg_depth: f32,
+        fileg_curve: Option<u8>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -468,6 +491,7 @@ where
                 fileg_sustain,
                 fileg_release,
                 fileg_depth,
+                fileg_curve,
                 fil_type,
                 sample_rate,
                 base_freq,
@@ -552,6 +576,7 @@ where
         fileg_sustain: f32,
         fileg_release: f32,
         fileg_depth: f32,
+        fileg_curve: Option<u8>,
         fil_type: FilterType,
         sample_rate: f32,
         base_freq: f32,
@@ -577,6 +602,7 @@ where
                 fileg_sustain,
                 fileg_release,
                 fileg_depth,
+                fileg_curve,
                 fil_type,
                 sample_rate,
                 base_freq,
