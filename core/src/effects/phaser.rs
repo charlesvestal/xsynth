@@ -81,8 +81,15 @@ impl StereoPhaser {
         let mut out_r = [0.0_f32];
         self.left.tick(&input_l, &mut out_l);
         self.right.tick(&input_r, &mut out_r);
+        // MOVE FORK / 2026-05-16: fundsp's phaser sums the allpass
+        // cascade output back with the input internally, so the wet
+        // tap is ~+3 dB hot vs DS's wet-only convention. Attenuate the
+        // wet by 0.5 (-6 dB) before crossfading — at mix=0.5 the
+        // signal is roughly +0 dB louder than dry (instead of +3.5 dB
+        // before this scale), matching DS's 08_phaser parity. Pure
+        // dry (mix=0) and pure wet (mix=1) endpoints are unaffected.
         let dry = 1.0 - self.mix;
-        let wet = self.mix;
+        let wet = self.mix * 0.5;
         (in_l * dry + out_l[0] * wet, in_r * dry + out_r[0] * wet)
     }
 }
