@@ -35,13 +35,39 @@ impl ChannelGroup {
         let mut channel_events_cache = Vec::new();
         let mut sample_cache_vecs = Vec::new();
 
+        // MOVE FORK / 2026-05-17: set flush-to-zero on every rayon
+        // worker spawned for the synth's voice-render pools. Long-tail
+        // voice envelopes go subnormal as they decay; without FZ the
+        // FPU traps each subnormal multiply for ~20× the nominal cost,
+        // pushing sustain-heavy blocks past the audio frame budget. The
+        // audio thread itself sets FZ on each xshim_render call (see
+        // xsynth_shim); these handlers cover the rayon workers that do
+        // the actual per-voice math.
+        fn set_fz_on_this_thread() {
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            unsafe {
+                let mut fpcr: u64;
+                std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr, options(nomem, nostack));
+                let new_fpcr = fpcr | (1u64 << 24);
+                if new_fpcr != fpcr {
+                    std::arch::asm!("msr fpcr, {0}", in(reg) new_fpcr, options(nomem, nostack));
+                }
+            }
+        }
+
         // Thread pool for individual channels to split between keys
         let channel_pool = match config.parallelism.key {
             ThreadCount::None => None,
-            ThreadCount::Auto => Some(Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap())),
+            ThreadCount::Auto => Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .start_handler(|_| set_fz_on_this_thread())
+                    .build()
+                    .unwrap(),
+            )),
             ThreadCount::Manual(threads) => Some(Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
+                    .start_handler(|_| set_fz_on_this_thread())
                     .build()
                     .unwrap(),
             )),
@@ -50,10 +76,16 @@ impl ChannelGroup {
         // Thread pool for splitting channels between threads
         let group_pool = match config.parallelism.channel {
             ThreadCount::None => None,
-            ThreadCount::Auto => Some(rayon::ThreadPoolBuilder::new().build().unwrap()),
+            ThreadCount::Auto => Some(
+                rayon::ThreadPoolBuilder::new()
+                    .start_handler(|_| set_fz_on_this_thread())
+                    .build()
+                    .unwrap(),
+            ),
             ThreadCount::Manual(threads) => Some(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
+                    .start_handler(|_| set_fz_on_this_thread())
                     .build()
                     .unwrap(),
             ),

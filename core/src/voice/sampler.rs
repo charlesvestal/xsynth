@@ -164,9 +164,31 @@ impl<Sampler: BufferSampler> SampleReaderNoLoop<Sampler> {
     }
 }
 
+/// MOVE FORK / 2026-05-17: end-edge fade-out length in frames.
+/// Some sample libraries (e.g. StereoRhodes) end mid-decay at a non-
+/// zero amplitude (~-30 dBFS); no_loop playback hits EOF and snaps to
+/// silence, producing an audible click. Linearly fading the last
+/// FADE_FRAMES samples to zero hides the discontinuity. 256 frames
+/// at 44.1 kHz ≈ 5.8 ms — short enough to be inaudible as a fade,
+/// long enough to suppress the click on samples ending around -20 dB.
+const SAMPLE_EDGE_FADE_FRAMES: usize = 256;
+
 impl<Sampler: BufferSampler> SampleReader for SampleReaderNoLoop<Sampler> {
     fn get(&mut self, pos: usize) -> f32 {
-        self.buffer.get(pos + self.offset)
+        let buf_pos = pos + self.offset;
+        let s = self.buffer.get(buf_pos);
+        // End-edge fade: when within the last SAMPLE_EDGE_FADE_FRAMES of
+        // the sample, ramp linearly to zero. Past the end the buffer
+        // returns 0 anyway, so the fade only affects in-range reads.
+        if let Some(len) = self.length {
+            let fade_start = len.saturating_sub(SAMPLE_EDGE_FADE_FRAMES);
+            if buf_pos >= fade_start {
+                let remaining = len.saturating_sub(buf_pos);
+                let fade = remaining as f32 / SAMPLE_EDGE_FADE_FRAMES as f32;
+                return s * fade.min(1.0);
+            }
+        }
+        s
     }
 
     fn is_past_end(&self, pos: usize) -> bool {
