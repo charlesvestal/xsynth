@@ -373,6 +373,27 @@ impl VoiceBuffer {
         s
     }
 
+    /// MOVE FORK / 2026-05-17 diag: expose damper-held flag so the
+    /// noteoff-no-op log can show whether NoteOff was deferred because
+    /// the sustain pedal (CC64) is held.
+    pub fn is_damper_held(&self) -> bool {
+        self.damper_held
+    }
+
+    /// MOVE FORK / 2026-05-17 diag: per-voice state dump (id, releasing,
+    /// killed). Concatenated string for one-line logging.
+    pub fn dump_voice_states(&self) -> String {
+        let mut out = String::new();
+        for (i, v) in self.buffer.iter().enumerate() {
+            if i > 0 { out.push(' '); }
+            out.push_str(&format!(
+                "{}:id={},rel={},kill={}",
+                i, v.id, v.is_releasing() as u8, v.is_killed() as u8,
+            ));
+        }
+        out
+    }
+
     pub fn set_damper(&mut self, damper: bool) {
         if self.damper_held && !damper {
             // Release all voices that are held by the damper

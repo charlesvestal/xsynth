@@ -39,7 +39,7 @@ use voice_spawners::*;
 pub use sample_storage::{MmapHolder, SampleStorage};
 #[cfg(unix)]
 #[allow(unused_imports)]
-pub use streaming::{IoPool, StreamRing, StreamedSampleSource, VoiceStream, HEAD_FRAMES, RING_FRAMES, take_underrun_count};
+pub use streaming::{IoPool, StreamRing, StreamedSampleSource, VoiceStream, HEAD_FRAMES, RING_FRAMES, take_underrun_count, take_underrun_breakdown};
 
 pub use config::*;
 
@@ -553,8 +553,13 @@ impl SampleSoundfont {
         // pair. RAM per head: HEAD_FRAMES × n_chans × 2 bytes.
         #[cfg(unix)]
         let head_cache: HashMap<_, Arc<[Arc<[i16]>]>> = {
-            use std::collections::HashSet;
-            let mut head_keys: HashSet<_> = HashSet::new();
+            // MOVE FORK / 2026-05-17: per-(sample,offset) max head length.
+            // For looped regions, the head must cover [target_offset,
+            // loop_end] so that loop-wrap reads (which land below the
+            // ring's trailing RING_FRAMES window when the loop region
+            // exceeds RING_FRAMES) always hit the always-resident head
+            // and never the bounded ring.
+            let mut head_lens: HashMap<_, usize> = HashMap::new();
             for region in &regions {
                 let key = sample_cache_from_region_params(region);
                 let src_rate = sources.get(&key).map(|(_, r)| *r)
@@ -566,14 +571,33 @@ impl SampleSoundfont {
                     src_rate,
                     stream_params.sample_rate,
                 );
-                head_keys.insert((key, target_offset));
+                // Region's required head length: HEAD_FRAMES for plain
+                // play-through, OR loop_end - target_offset for looped
+                // regions so the loop region itself is fully resident.
+                let mut needed = streaming::HEAD_FRAMES;
+                let region_loops = region.loop_start != region.loop_end
+                    && matches!(region.loop_mode,
+                        LoopMode::LoopContinuous | LoopMode::LoopSustain);
+                if region_loops {
+                    let loop_end_target = convert_sample_index(
+                        region.loop_end,
+                        src_rate,
+                        stream_params.sample_rate,
+                    ) as usize;
+                    if loop_end_target > target_offset as usize {
+                        let span = loop_end_target - target_offset as usize + 1;
+                        if span > needed { needed = span; }
+                    }
+                }
+                let entry = head_lens.entry((key, target_offset)).or_insert(0);
+                if needed > *entry { *entry = needed; }
             }
-            let mut map = HashMap::with_capacity(head_keys.len());
-            for (key, target_offset) in head_keys {
+            let mut map = HashMap::with_capacity(head_lens.len());
+            for ((key, target_offset), head_len) in head_lens {
                 check_cancel()?;
                 if let Some(src) = sources.get(&key).map(|(s, _)| s.clone()) {
                     let head = src
-                        .read_head_at(target_offset as usize)
+                        .read_head_at_len(target_offset as usize, head_len)
                         .unwrap_or_else(|| {
                             (0..src.n_chans)
                                 .map(|_| Arc::from(Vec::new().into_boxed_slice()))

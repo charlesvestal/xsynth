@@ -55,11 +55,43 @@ fn underrun_counter() -> &'static AtomicU32 {
     C.get_or_init(|| AtomicU32::new(0))
 }
 
+/// MOVE FORK / 2026-05-17 diag: split underrun categories.
+/// - ahead: pos >= write_pos AND not EOF (ring not yet filled to here)
+/// - behind: pos < write_pos - RING_FRAMES (voice fell behind window —
+///   typically loop-wrap or pitch glitch)
+/// - before_head: pos < head_start (pathological — voice read before head's
+///   start file frame)
+fn underrun_ahead_counter() -> &'static AtomicU32 {
+    use std::sync::OnceLock;
+    static C: OnceLock<AtomicU32> = OnceLock::new();
+    C.get_or_init(|| AtomicU32::new(0))
+}
+fn underrun_behind_counter() -> &'static AtomicU32 {
+    use std::sync::OnceLock;
+    static C: OnceLock<AtomicU32> = OnceLock::new();
+    C.get_or_init(|| AtomicU32::new(0))
+}
+fn underrun_before_head_counter() -> &'static AtomicU32 {
+    use std::sync::OnceLock;
+    static C: OnceLock<AtomicU32> = OnceLock::new();
+    C.get_or_init(|| AtomicU32::new(0))
+}
+
 /// Public accessor: snapshot + reset the underrun counter. Called from
 /// the C plugin's render-block perf log so underruns appear next to
 /// voice count, render time, etc.
 pub fn take_underrun_count() -> u32 {
     underrun_counter().swap(0, Ordering::Relaxed)
+}
+
+/// MOVE FORK / 2026-05-17 diag: per-category underrun snapshots.
+/// Returns (ahead, behind, before_head). Each call resets its counter.
+pub fn take_underrun_breakdown() -> (u32, u32, u32) {
+    (
+        underrun_ahead_counter().swap(0, Ordering::Relaxed),
+        underrun_behind_counter().swap(0, Ordering::Relaxed),
+        underrun_before_head_counter().swap(0, Ordering::Relaxed),
+    )
 }
 
 /// Always-resident head buffer length in frames. 1000 ms at 44.1 kHz.
@@ -186,10 +218,27 @@ impl StreamedSampleSource {
     /// across regions. Returns None on read failure (caller falls back
     /// to a zero-filled head so the voice gets silence at the start
     /// rather than crashing).
+    /// MOVE FORK / 2026-05-17: convenience wrapper that calls
+    /// `read_head_at_len(frame_offset, HEAD_FRAMES)`. Kept for callers
+    /// that don't need a custom head length.
     #[cfg(unix)]
     pub fn read_head_at(&self, frame_offset: usize) -> Option<Vec<Arc<[i16]>>> {
+        self.read_head_at_len(frame_offset, HEAD_FRAMES)
+    }
+
+    /// MOVE FORK / 2026-05-17: pre-load a resident head buffer of
+    /// `desired_len` frames starting at `frame_offset`. Looped SFZ
+    /// regions extend this past HEAD_FRAMES so the entire loop region
+    /// is always resident — the bounded ring buffer can't satisfy a
+    /// loop-wrap read that lands earlier than (write_pos - RING_FRAMES).
+    #[cfg(unix)]
+    pub fn read_head_at_len(
+        &self,
+        frame_offset: usize,
+        desired_len: usize,
+    ) -> Option<Vec<Arc<[i16]>>> {
         let frames_available = self.frames.saturating_sub(frame_offset);
-        let head_len = HEAD_FRAMES.min(frames_available);
+        let head_len = desired_len.min(frames_available);
         if head_len == 0 {
             // Region offset is at or past the end of the sample — give
             // empty heads; voice will read silence from the ring.
@@ -424,6 +473,10 @@ pub struct StreamRing {
     /// Set by the I/O thread when EOF is reached (write_pos >= total_frames).
     /// Voice uses this to short-circuit underrun detection past EOF.
     eof: AtomicBool,
+    /// MOVE FORK / 2026-05-17 diag: last pos passed to VoiceStream::get
+    /// for this ring. Logged when pos goes backward — diagnostic for the
+    /// "behind" underrun mystery on no_loop WörliTzer regions.
+    last_read_pos: AtomicUsize,
 }
 
 impl StreamRing {
@@ -440,6 +493,7 @@ impl StreamRing {
             write_pos: AtomicUsize::new(head_end_frame),
             consumed_hint: AtomicUsize::new(head_end_frame),
             eof: AtomicBool::new(false),
+            last_read_pos: AtomicUsize::new(0),
         }
     }
 
@@ -571,6 +625,14 @@ impl VoiceStream {
         if pos >= head_start && pos < head_start + head_len {
             // SAFETY: bounds checked above; head is Arc<[i16]>.
             self.head[pos - head_start]
+        } else if pos < head_start {
+            // Pathological: voice read a file frame BEFORE the head buffer
+            // begins. Only happens if a region's loop wraps to a position
+            // before its own offset (rare). Count separately so the perf
+            // log surfaces this distinct mode.
+            underrun_before_head_counter().fetch_add(1, Ordering::Relaxed);
+            underrun_counter().fetch_add(1, Ordering::Relaxed);
+            0
         } else {
             // Mark consumed BEFORE reading: lets the I/O pool know how
             // far the voice has advanced, even if this call underruns.
@@ -578,9 +640,15 @@ impl VoiceStream {
             match self.ring.get(pos) {
                 Some(v) => v,
                 None => {
-                    // Underrun: ring isn't filled to this position yet.
-                    // Count it so the plugin's perf log surfaces the
-                    // glitch source. Returns 0 (silence) for this lane.
+                    // Categorize the underrun: ahead (ring not filled to
+                    // pos yet) vs behind (voice pos fell out of the
+                    // trailing window — typically loop wrap).
+                    let write = self.ring.write_pos.load(Ordering::Acquire);
+                    if pos >= write {
+                        underrun_ahead_counter().fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        underrun_behind_counter().fetch_add(1, Ordering::Relaxed);
+                    }
                     underrun_counter().fetch_add(1, Ordering::Relaxed);
                     0
                 }

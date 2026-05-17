@@ -67,13 +67,16 @@ impl KeyData {
                     {
                         use std::io::Write;
                         let stats = self.voices.buffer_stats();
+                        let damper = self.voices.is_damper_held();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
+                        let per_voice = self.voices.dump_voice_states();
                         let line = format!(
-                            "[xsynth] noteoff no-op key={} t={}ms total={} releasing={} killed={} rt={}\n",
+                            "[xsynth] noteoff no-op key={} t={}ms total={} releasing={} killed={} rt={} damper={} voices=[{}]\n",
                             self.key, now, stats.total, stats.releasing, stats.killed, stats.release_trigger,
+                            damper, per_voice,
                         );
                         if let Ok(mut f) = std::fs::OpenOptions::new()
                             .create(true)
