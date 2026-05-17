@@ -197,13 +197,27 @@ pub struct StreamedSampleSource {
     pub file: Arc<File>,
     /// On-disk layout. Determines the pread byte-offset formula.
     pub layout: SampleLayout,
-    /// Total frame count per channel.
+    /// Total frame count per channel, in `data_rate` frames.
     pub frames: usize,
     /// Number of audio channels (1 mono, 2 stereo).
     pub n_chans: usize,
-    /// Source sample rate (Hz). Mirrors what mmap-cache returns so the
-    /// pitch math doesn't care which backend produced the sample.
+    /// Source sample rate (Hz). The natural rate of the original audio
+    /// file — used by SFZ frame-index conversion (`region.offset` is
+    /// expressed in source-rate frames per spec).
     pub src_rate: u32,
+    /// MOVE FORK / 2026-05-17 (day 3): the sample rate of data actually
+    /// stored in the ring buffer (and head buffer).
+    /// - `.x44c` cache (Separated): data is pre-resampled to target rate,
+    ///   so `data_rate == cached_tgt_rate == stream_params.sample_rate`.
+    /// - WAV-direct (Interleaved): data stays in the WAV file's rate, so
+    ///   `data_rate == src_rate`.
+    /// - FLAC-direct (Flac): data is decoded at the FLAC's native rate
+    ///   (no I/O-thread resampling), so `data_rate == src_rate`.
+    ///
+    /// When `data_rate != stream_params.sample_rate`, the voice spawner
+    /// multiplies its `speed_mult` by `data_rate / stream_params.sample_rate`
+    /// so the existing linear-interp playback rate-converts on the fly.
+    pub data_rate: u32,
 }
 
 impl StreamedSampleSource {
@@ -1095,6 +1109,7 @@ mod tests {
             frames,
             n_chans,
             src_rate: 44100,
+            data_rate: 44100,
         })
     }
 
@@ -1321,6 +1336,7 @@ mod tests {
             frames: n_frames,
             n_chans,
             src_rate: sr,
+            data_rate: sr,
         });
 
         // Head read at frame 0: must match reference for [0, HEAD_FRAMES).

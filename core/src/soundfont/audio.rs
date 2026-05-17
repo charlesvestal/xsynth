@@ -420,6 +420,9 @@ fn try_open_streamed_cache(
         frames,
         n_chans,
         src_rate,
+        // Cache was prebaked AT target rate; data in the file is already
+        // resampled. Voice plays at native target rate.
+        data_rate: cached_tgt_rate,
     });
     Some((source, src_rate))
 }
@@ -499,7 +502,10 @@ fn try_open_wav_streamed(
     // Strict eligibility checks. Anything fancy → fall back.
     if format_tag != 1 { return None; }              // 1 = PCM
     if bits_per_sample != 16 { return None; }        // Only 16-bit
-    if sample_rate != target_rate { return None; }   // Must match output rate
+    // MOVE FORK / 2026-05-17 (day 3): rate mismatch is OK — the voice's
+    // linear-interp playback handles SRC by playing source-rate data at
+    // an adjusted speed_mult (data_rate / target_rate).
+    let _ = target_rate;
     if wav_chans == 0 || wav_chans > 2 { return None; } // Only mono/stereo
 
     let frame_bytes = (wav_chans as u32) * 2;
@@ -519,6 +525,9 @@ fn try_open_wav_streamed(
         frames,
         n_chans: wav_chans as usize,
         src_rate: sample_rate,
+        // WAV data stays at the file's native rate; voice does SRC via
+        // speed_mult when target_rate differs.
+        data_rate: sample_rate,
     });
     Some((source, sample_rate))
 }
@@ -565,7 +574,11 @@ fn try_open_flac_streamed(
     let n_frames = track.codec_params.n_frames? as usize;
     let n_chans = channels.count();
 
-    if sample_rate != target_rate { return None; }
+    // MOVE FORK / 2026-05-17 (day 3): rate mismatch is OK. The ring
+    // stores FLAC-decoded samples at their native rate; the voice
+    // spawner multiplies speed_mult by data_rate/target_rate so playback
+    // is rate-converted on the fly via the existing linear interpolator.
+    let _ = target_rate;
     if n_chans == 0 || n_chans > 2 { return None; }
     if n_frames == 0 { return None; }
     let _ = target_chans;
@@ -582,6 +595,8 @@ fn try_open_flac_streamed(
         frames: n_frames,
         n_chans,
         src_rate: sample_rate,
+        // FLAC decoded data stays at source rate (no I/O-thread SRC).
+        data_rate: sample_rate,
     });
     Some((source_arc, sample_rate))
 }

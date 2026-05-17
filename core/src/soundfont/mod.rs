@@ -562,14 +562,17 @@ impl SampleSoundfont {
             let mut head_lens: HashMap<_, usize> = HashMap::new();
             for region in &regions {
                 let key = sample_cache_from_region_params(region);
-                let src_rate = sources.get(&key).map(|(_, r)| *r)
-                    .unwrap_or(stream_params.sample_rate);
-                // Convert SFZ source-rate offset to target-rate (matches
-                // .x44c cache frame layout + BufferSampler::get(pos)).
+                // MOVE FORK / 2026-05-17 (day 3): offset is expressed in
+                // source-rate frames (SFZ spec). Convert to the ring's
+                // data rate — for cache layout that's target_rate, for
+                // WAV/FLAC streaming that's the source's native rate.
+                let (src_rate, data_rate) = sources.get(&key)
+                    .map(|(s, r)| (*r, s.data_rate))
+                    .unwrap_or((stream_params.sample_rate, stream_params.sample_rate));
                 let target_offset = convert_sample_index(
                     region.offset,
                     src_rate,
-                    stream_params.sample_rate,
+                    data_rate,
                 );
                 // Region's required head length: HEAD_FRAMES for plain
                 // play-through, OR loop_end - target_offset for looped
@@ -630,6 +633,37 @@ impl SampleSoundfont {
                 continue;
             }
 
+            // MOVE FORK / 2026-05-17 (day 3): if this region's sample is
+            // backed by a streamed source whose data is at a different
+            // rate than the target, fold that rate ratio into speed_mult
+            // so the voice's linear interpolator resamples on the fly.
+            // Cache (Separated) layouts always have data_rate ==
+            // target_rate so the ratio is 1.0 — no behavior change.
+            let data_rate_ratio: f32 = {
+                #[cfg(unix)]
+                {
+                    sources.get(&params).map(|(s, _)| {
+                        s.data_rate as f32 / stream_params.sample_rate as f32
+                    }).unwrap_or(1.0)
+                }
+                #[cfg(not(unix))]
+                {
+                    1.0
+                }
+            };
+            // Diagnostic: log when ratio != 1.0 (i.e. SRC kicks in).
+            if (data_rate_ratio - 1.0).abs() > 1e-4 {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                {
+                    let _ = writeln!(f,
+                        "[xsynth] SRC region: path={} ratio={:.4}",
+                        params.path.display(), data_rate_ratio);
+                }
+            }
+
             // MOVE FORK: one Arc per region for live `_oncc` bindings,
             // cloned cheaply into every (key, vel) spawner.
             let volume_oncc: Arc<[(u8, f32)]> = region.volume_oncc.clone().into();
@@ -647,7 +681,8 @@ impl SampleSoundfont {
                     let index = key_vel_to_index(key as u8, vel);
                     let speed_mult =
                         get_speed_mult_from_keys(key as u8, region.pitch_keycenter as u8)
-                            * cents_factor(region.tune as f32);
+                            * cents_factor(region.tune as f32)
+                            * data_rate_ratio;
 
                     let mut envelope = region.ampeg_envelope.clone();
                     envelope.ampeg_release +=
