@@ -47,3 +47,18 @@ harness = false
 [[bench]]
 name = "send_events"
 harness = false
+
+# MOVE FORK / 2026-05-16: Mac-side CLI to pre-bake `.x44c` sample caches
+# for sample libraries that would otherwise take 30+ minutes to decode
+# on Move's CPU at first-load time. Walks a directory of audio files
+# and decodes each in parallel via rayon.
+[[bin]]
+name = "prebake_cache"
+path = "src/bin/prebake_cache.rs"
+
+# MOVE FORK / 2026-05-16: render a 4-note chord through xsynth-core +
+# the on-device master gain + peak limiter, output raw + processed
+# WAVs. Used to debug output-stage distortion off-device.
+[[bin]]
+name = "chord_render"
+path = "src/bin/chord_render.rs"

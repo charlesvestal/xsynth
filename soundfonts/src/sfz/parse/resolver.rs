@@ -56,7 +56,32 @@ impl TokenResolver {
             match token {
                 SfzTokenWithMeta::Import(path) => {
                     let path = apply_defines(&path, &self.defines).into_owned();
-                    let include_path = parent_path.join(path);
+                    // MOVE FORK / 2026-05-16: SFZ spec says #include resolves
+                    // relative to the file containing the directive. In
+                    // practice many SFZ libraries (e.g. Salamander Grand
+                    // Piano V3) emit includes inside nested sub-files
+                    // using paths relative to the SFZ ROOT — Salamander's
+                    // Data/notes.txt contains `#include "Data/vel_01.txt"`
+                    // which the author intended to resolve to
+                    // <root>/Data/vel_01.txt, not <root>/Data/Data/vel_01.txt.
+                    // sfizz and ARIA both fall back to root-relative when
+                    // the direct relative path doesn't exist; we match
+                    // that convention to keep author-shipped libraries
+                    // loadable without manual fixups.
+                    let direct = parent_path.join(&path);
+                    let include_path = if direct.exists() {
+                        direct
+                    } else if let Some(root) = self.include_stack.first() {
+                        let root_parent = root.parent().unwrap_or(root);
+                        let root_relative = root_parent.join(&path);
+                        if root_relative.exists() {
+                            root_relative
+                        } else {
+                            direct  // surface the spec-relative path in error
+                        }
+                    } else {
+                        direct
+                    };
                     let cache_key = (include_path.clone(), self.define_generation);
 
                     if let Some(cached_tokens) = self.include_cache.get(&cache_key) {

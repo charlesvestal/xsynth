@@ -155,8 +155,32 @@ pub enum AudioLoadError {
 }
 
 use super::sample_storage::{MmapHolder, SampleStorage};
+#[cfg(unix)]
+use super::streaming::{StreamedSampleSource, HEAD_FRAMES};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 type ProcessedSample = (Arc<[Arc<SampleStorage>]>, u32);
+
+#[cfg(unix)]
+type StreamedSample = (Arc<StreamedSampleSource>, u32);
+
+/// MOVE FORK / 2026-05-16: pre-bake the `.x44c` cache for a single audio
+/// file. Returns Ok(()) when the cache exists and is current after this
+/// call. Used by the Mac-side `prebake_cache` CLI to convert sample
+/// libraries (Salamander Grand Piano etc.) into Move-streamable form
+/// without doing the slow FLAC decode on the device.
+///
+/// Triggers `load_audio_file` (full decode + cache write) when needed,
+/// discards the heap result. Fast path when cache is already current.
+pub fn prebake_audio_cache(
+    path: &std::path::Path,
+    stream_params: AudioStreamParams,
+) -> Result<(), AudioLoadError> {
+    let pb = path.to_path_buf();
+    let _ = load_audio_file(&pb, stream_params)?;
+    Ok(())
+}
 
 pub(super) fn load_audio_file(
     path: &PathBuf,
@@ -268,6 +292,221 @@ pub(super) fn load_audio_file(
         .map(|chan| Arc::new(SampleStorage::from_heap(chan.clone())))
         .collect();
     Ok((heap, sample_rate))
+}
+
+/// MOVE FORK / 2026-05-16: streamed equivalent of `load_audio_file`.
+/// Returns an open file handle + per-channel byte offsets + a small
+/// always-resident head buffer. The voice spawner uses this to construct
+/// per-voice ring buffers that an IoPool thread fills in the background.
+///
+/// On cache miss, falls back to `load_audio_file` (which decodes and
+/// writes the .x44c cache) and then re-opens for streaming. The heap
+/// data returned by the fallback path is dropped — wasteful on first-
+/// load but only one-time. Subsequent loads hit the cache directly.
+#[cfg(unix)]
+pub(super) fn load_audio_file_streamed(
+    path: &PathBuf,
+    stream_params: AudioStreamParams,
+) -> Result<StreamedSample, AudioLoadError> {
+    // MOVE FORK / 2026-05-16: direct WAV streaming. For canonical
+    // 16-bit PCM WAVs at the target sample rate, skip the entire
+    // decode + .x44c cache pass — stream straight from the .wav file.
+    // Wins: zero prebake, instant first-load, no cache disk space.
+    if let Some(s) =
+        try_open_wav_streamed(path, stream_params.sample_rate, stream_params.channels)
+    {
+        return Ok(s);
+    }
+    if let Some(s) =
+        try_open_streamed_cache(path, stream_params.sample_rate, stream_params.channels)
+    {
+        return Ok(s);
+    }
+
+    // Cache is missing or stale. Build it via the full decode path,
+    // then drop the heap result and re-open as streamed.
+    let _heap = load_audio_file(path, stream_params)?;
+    drop(_heap);
+
+    if let Some(s) =
+        try_open_streamed_cache(path, stream_params.sample_rate, stream_params.channels)
+    {
+        return Ok(s);
+    }
+
+    // Should not happen: load_audio_file should have written the cache
+    // successfully. If we get here, the cache write failed silently
+    // (disk full, permissions, etc.) — surface as IO error.
+    Err(AudioLoadError::IOError(io::Error::new(
+        io::ErrorKind::Other,
+        "streamed load: cache file not present after decode pass",
+    )))
+}
+
+/// MOVE FORK / 2026-05-16: open an existing .x44c cache for streamed
+/// access. Reads only the header + head buffer (first HEAD_FRAMES of
+/// each channel); the rest of the sample data stays on disk, paged in
+/// by the IoPool's pread calls as voices play.
+///
+/// Returns None if cache is missing, stale, or has mismatched params.
+#[cfg(unix)]
+fn try_open_streamed_cache(
+    source: &PathBuf,
+    target_rate: u32,
+    target_chans: ChannelCount,
+) -> Option<StreamedSample> {
+    let cp = cache_path_for(source);
+    let src_meta = std::fs::metadata(source).ok()?;
+    let cache_meta = std::fs::metadata(&cp).ok()?;
+    let src_mtime = src_meta.modified().ok()?;
+    let cache_mtime = cache_meta.modified().ok()?;
+    if cache_mtime < src_mtime { return None; }
+
+    let file = File::open(&cp).ok()?;
+    let mut hdr_bytes = [0u8; CACHE_HEADER_BYTES];
+    if file.read_at(&mut hdr_bytes, 0).ok()? < CACHE_HEADER_BYTES {
+        return None;
+    }
+    let read_u32 = |i: usize| -> u32 {
+        u32::from_le_bytes([
+            hdr_bytes[i * 4], hdr_bytes[i * 4 + 1],
+            hdr_bytes[i * 4 + 2], hdr_bytes[i * 4 + 3],
+        ])
+    };
+    if read_u32(0) != CACHE_MAGIC { return None; }
+    if read_u32(1) != CACHE_VERSION { return None; }
+    let src_rate = read_u32(2);
+    let cached_tgt_rate = read_u32(3);
+    let cached_tgt_chs = read_u32(4);
+    let n_chans = read_u32(5) as usize;
+    let frames = read_u32(6) as usize;
+
+    if cached_tgt_rate != target_rate { return None; }
+    if cached_tgt_chs != target_chans.count() as u32 { return None; }
+    if n_chans == 0 || frames == 0 || n_chans > 8 { return None; }
+
+    let bytes_per_chan = frames * 2;
+    let expected_size = CACHE_HEADER_BYTES + n_chans * bytes_per_chan;
+    if (cache_meta.len() as usize) < expected_size { return None; }
+
+    // Per-channel byte offsets within the file. Channels are stored
+    // back-to-back: [hdr][ch0 i16 data][ch1 i16 data]...
+    let byte_offset_per_channel: Vec<u64> = (0..n_chans)
+        .map(|c| (CACHE_HEADER_BYTES + c * bytes_per_chan) as u64)
+        .collect();
+
+    // MOVE FORK / 2026-05-16: head buffers are no longer per-sample;
+    // they're per-(sample, region.offset). Caller (new_sfz_inner) loads
+    // heads via source.read_head_at(offset) after construction.
+    let source = Arc::new(StreamedSampleSource {
+        file: Arc::new(file),
+        layout: super::streaming::SampleLayout::Separated {
+            byte_offset_per_channel,
+        },
+        frames,
+        n_chans,
+        src_rate,
+    });
+    Some((source, src_rate))
+}
+
+/// MOVE FORK / 2026-05-16: open a canonical 16-bit PCM WAV file as a
+/// streamed source directly, no `.x44c` cache. Eligible iff the WAV is
+/// exactly at the target sample rate, 16-bit, mono or stereo PCM. Any
+/// non-match (different bit depth, sample rate, compressed format,
+/// odd extension, non-canonical chunks) returns `None` and the caller
+/// falls back to the cache + decode path.
+///
+/// Skips the entire decode + cache-write pass for 44/16 WAV libraries
+/// like Salamander Grand Piano V3 (44.1 kHz / 16-bit variant): preset
+/// load goes straight from filesystem to streamable handle, no
+/// preprocessing, no prebake.
+///
+/// Cache files (.x44c) for the same path are intentionally ignored —
+/// when the WAV already IS the streaming format, the cache is dead
+/// weight.
+#[cfg(unix)]
+fn try_open_wav_streamed(
+    source: &PathBuf,
+    target_rate: u32,
+    target_chans: ChannelCount,
+) -> Option<StreamedSample> {
+    // Only consider .wav extensions; .flac etc. go through symphonia.
+    let ext = source.extension().and_then(|e| e.to_str()).map(str::to_lowercase);
+    if ext.as_deref() != Some("wav") {
+        return None;
+    }
+
+    let file = File::open(source).ok()?;
+    // Read enough of the header to validate format + find the `data`
+    // chunk. 12 bytes RIFF header + a few chunks; canonical PCM WAVs
+    // are typically <= 128 bytes of header.
+    let mut hdr = [0u8; 256];
+    let n = file.read_at(&mut hdr, 0).ok()?;
+    if n < 44 { return None; }
+
+    // RIFF / WAVE.
+    if &hdr[0..4] != b"RIFF" { return None; }
+    if &hdr[8..12] != b"WAVE" { return None; }
+
+    // Scan chunks for `fmt ` and `data`. Each chunk: 4-byte tag,
+    // 4-byte LE size, then payload. Start at byte 12 (after WAVE).
+    let mut pos = 12usize;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (format_tag, n_chans, sample_rate, bits_per_sample)
+    let mut data_offset: Option<u64> = None;
+    let mut data_byte_len: Option<u64> = None;
+
+    while pos + 8 <= n {
+        let tag = &hdr[pos..pos + 4];
+        let size = u32::from_le_bytes([hdr[pos + 4], hdr[pos + 5], hdr[pos + 6], hdr[pos + 7]]) as u64;
+        if tag == b"fmt " && pos + 8 + 16 <= n {
+            let format_tag = u16::from_le_bytes([hdr[pos + 8], hdr[pos + 9]]);
+            let n_chans_raw = u16::from_le_bytes([hdr[pos + 10], hdr[pos + 11]]);
+            let sample_rate = u32::from_le_bytes([
+                hdr[pos + 12], hdr[pos + 13], hdr[pos + 14], hdr[pos + 15],
+            ]);
+            let bits_per_sample = u16::from_le_bytes([hdr[pos + 22], hdr[pos + 23]]);
+            fmt = Some((format_tag, n_chans_raw, sample_rate, bits_per_sample));
+            pos += 8 + size as usize;
+            continue;
+        }
+        if tag == b"data" {
+            data_offset = Some((pos + 8) as u64);
+            data_byte_len = Some(size);
+            break;
+        }
+        pos += 8 + size as usize;
+    }
+
+    let (format_tag, wav_chans, sample_rate, bits_per_sample) = fmt?;
+    let data_offset = data_offset?;
+    let data_byte_len = data_byte_len?;
+
+    // Strict eligibility checks. Anything fancy → fall back.
+    if format_tag != 1 { return None; }              // 1 = PCM
+    if bits_per_sample != 16 { return None; }        // Only 16-bit
+    if sample_rate != target_rate { return None; }   // Must match output rate
+    if wav_chans == 0 || wav_chans > 2 { return None; } // Only mono/stereo
+
+    let frame_bytes = (wav_chans as u32) * 2;
+    let frames = (data_byte_len / frame_bytes as u64) as usize;
+    if frames == 0 { return None; }
+    let _ = target_chans;
+
+    // MOVE FORK / 2026-05-16: per-(sample, offset) heads are loaded by
+    // the caller via source.read_head_at(offset). Source itself carries
+    // only the file handle + layout metadata.
+    let source = Arc::new(StreamedSampleSource {
+        file: Arc::new(file),
+        layout: super::streaming::SampleLayout::Interleaved {
+            data_byte_offset: data_offset,
+            frame_bytes,
+        },
+        frames,
+        n_chans: wav_chans as usize,
+        src_rate: sample_rate,
+    });
+    Some((source, sample_rate))
 }
 
 struct BuilderVecs {

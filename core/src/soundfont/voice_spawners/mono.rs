@@ -5,7 +5,7 @@ use simdeez::Simd;
 use crate::{
     effects::BiQuadFilter,
     voice::{
-        BufferSampler, SIMDMonoVoiceCutoffLive, SIMDSample, SIMDSampleGrabber, SIMDSampleMono,
+        SIMDMonoVoiceCutoffLive, SIMDSample, SIMDSampleGrabber, SIMDSampleMono,
         SIMDVoiceGenerator,
     },
     AudioStreamParams,
@@ -22,7 +22,9 @@ use crate::{
 
 use xsynth_soundfonts::LoopMode;
 
-use crate::soundfont::{Interpolator, LoopParams, SampleStorage, SampleVoiceSpawnerParams, VoiceSpawner};
+use crate::soundfont::{Interpolator, LoopParams, SampleSource, SampleVoiceSpawnerParams, VoiceSpawner};
+#[allow(unused_imports)]
+use crate::soundfont::SampleStorage;
 
 pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     speed_mult: f32,
@@ -34,7 +36,7 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     loop_params: LoopParams,
     amp: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
-    samples: Arc<[Arc<SampleStorage>]>,
+    sample_source: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
     vel: u8,
@@ -85,7 +87,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             loop_params: params.loop_params.clone(),
             amp,
             volume_envelope_params: params.envelope.clone(),
-            samples: params.sample.clone(),
+            sample_source: params.sample.clone(),
             interpolator: params.interpolator,
             exclusive_class: params.exclusive_class,
             vel,
@@ -109,43 +111,55 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         }
     }
 
-    fn begin_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
-        // Currently there's only the f32 buffer samples, more could be added in the future.
-        #[allow(clippy::redundant_closure)]
-        self.make_sample_reader(control, cc_state, |s| BufferSamplers::new_f32(s))
-    }
-
-    fn make_sample_reader<BS: 'static + BufferSampler>(
-        &self,
-        control: &VoiceControlData,
-        cc_state: &CcState,
-        make_bs: impl Fn(Arc<SampleStorage>) -> BS,
-    ) -> Box<dyn Voice> {
-        match self.loop_params.mode {
-            LoopMode::LoopContinuous => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderLoop::new(make_bs(s), self.loop_params.clone())
-            }),
-            LoopMode::LoopSustain => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderLoopSustain::new(make_bs(s), self.loop_params.clone())
-            }),
-            LoopMode::NoLoop | LoopMode::OneShot => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderNoLoop::new(make_bs(s), self.loop_params.clone())
-            }),
+    /// MOVE FORK / 2026-05-16: build a single-channel BufferSamplers from
+    /// the SampleSource. Mono spawner always uses channel 0.
+    fn build_buffer_sampler(&self) -> BufferSamplers {
+        match &self.sample_source {
+            SampleSource::Heap(arr) => BufferSamplers::new_f32(arr[0].clone()),
+            #[cfg(unix)]
+            SampleSource::Streamed { source, io_pool, head, head_start } => {
+                let empty: Arc<[i16]> = Arc::from(Vec::new().into_boxed_slice());
+                let head_0 = head.get(0).cloned().unwrap_or(empty);
+                let stream = io_pool.register(
+                    source.clone(), 0, head_0, *head_start as usize,
+                );
+                BufferSamplers::streamed(stream)
+            }
         }
     }
 
-    fn make_sample_grabber<SR: 'static + SampleReader>(
+    fn begin_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
+        let bs = self.build_buffer_sampler();
+        match self.loop_params.mode {
+            LoopMode::LoopContinuous => {
+                let r = SampleReaderLoop::new(bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, r)
+            }
+            LoopMode::LoopSustain => {
+                let r = SampleReaderLoopSustain::new(bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, r)
+            }
+            LoopMode::NoLoop | LoopMode::OneShot => {
+                let r = SampleReaderNoLoop::new(bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, r)
+            }
+        }
+    }
+
+    fn dispatch_interpolator<SR: 'static + SampleReader>(
         &self,
         control: &VoiceControlData,
         cc_state: &CcState,
-        make_bs: impl Fn(Arc<SampleStorage>) -> SR,
+        reader: SR,
     ) -> Box<dyn Voice> {
         match self.interpolator {
             Interpolator::Nearest => {
-                self.generate_sampler(control, cc_state, |s| SIMDNearestSampleGrabber::new(make_bs(s)))
+                let g = SIMDNearestSampleGrabber::new(reader);
+                self.generate_sampler(control, cc_state, g)
             }
             Interpolator::Linear => {
-                self.generate_sampler(control, cc_state, |s| SIMDLinearSampleGrabber::new(make_bs(s)))
+                let g = SIMDLinearSampleGrabber::new(reader);
+                self.generate_sampler(control, cc_state, g)
             }
         }
     }
@@ -154,13 +168,10 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         &self,
         control: &VoiceControlData,
         cc_state: &CcState,
-        make_sampler: impl Fn(Arc<SampleStorage>) -> SG,
+        grabber: SG,
     ) -> Box<dyn Voice> {
-        let sample = make_sampler(self.samples[0].clone());
-
         let pitch_fac = self.create_pitch_fac(control);
-
-        let sampler = SIMDMonoVoiceSampler::new(sample, pitch_fac);
+        let sampler = SIMDMonoVoiceSampler::new(grabber, pitch_fac);
         self.apply_voice_params(sampler, control, cc_state)
     }
 

@@ -5,7 +5,7 @@ use simdeez::Simd;
 use crate::{
     effects::BiQuadFilter,
     voice::{
-        BufferSampler, SIMDSample, SIMDSampleGrabber, SIMDSampleMono, SIMDSampleStereo,
+        SIMDSample, SIMDSampleGrabber, SIMDSampleMono, SIMDSampleStereo,
         SIMDStereoVoiceCutoffLive, SIMDVoiceGenerator,
     },
     AudioStreamParams,
@@ -23,7 +23,9 @@ use crate::{
 
 use xsynth_soundfonts::LoopMode;
 
-use crate::soundfont::{Interpolator, LoopParams, SampleStorage, SampleVoiceSpawnerParams, VoiceSpawner};
+use crate::soundfont::{Interpolator, LoopParams, SampleSource, SampleVoiceSpawnerParams, VoiceSpawner};
+#[allow(unused_imports)]
+use crate::soundfont::SampleStorage;
 
 pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     speed_mult: f32,
@@ -37,7 +39,7 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     amp: f32,
     pan: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
-    samples: Arc<[Arc<SampleStorage>]>,
+    sample_source: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
     vel: u8,
@@ -116,7 +118,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             amp,
             pan: params.pan,
             volume_envelope_params: params.envelope.clone(),
-            samples: params.sample.clone(),
+            sample_source: params.sample.clone(),
             interpolator: params.interpolator,
             exclusive_class: params.exclusive_class,
             vel,
@@ -156,58 +158,92 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         }
     }
 
-    fn begin_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
-        // Currently there's only the f32 buffer samples, more could be added in the future.
-        #[allow(clippy::redundant_closure)]
-        self.make_sample_reader(control, cc_state, |s| BufferSamplers::new_f32(s))
-    }
-
-    fn make_sample_reader<BS: 'static + BufferSampler>(
-        &self,
-        control: &VoiceControlData,
-        cc_state: &CcState,
-        make_bs: impl Fn(Arc<SampleStorage>) -> BS,
-    ) -> Box<dyn Voice> {
-        match self.loop_params.mode {
-            LoopMode::LoopContinuous => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderLoop::new(make_bs(s), self.loop_params.clone())
-            }),
-            LoopMode::LoopSustain => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderLoopSustain::new(make_bs(s), self.loop_params.clone())
-            }),
-            LoopMode::NoLoop | LoopMode::OneShot => self.make_sample_grabber(control, cc_state, move |s| {
-                SampleReaderNoLoop::new(make_bs(s), self.loop_params.clone())
-            }),
+    /// MOVE FORK / 2026-05-16: build a (left, right) pair of BufferSamplers
+    /// from the SampleSource. Heap path clones channel Arcs; streamed path
+    /// registers per-voice ring buffers with the IoPool. Mono → stereo
+    /// fan-out (channel 0 twice) is handled per-variant.
+    fn build_buffer_samplers(&self) -> (BufferSamplers, BufferSamplers) {
+        match &self.sample_source {
+            SampleSource::Heap(arr) => {
+                // Stereo fan-out already done in the load path: arr.len()
+                // == 2. Mono SFZ regions are duplicated to [arr[0], arr[0]].
+                let left_idx = 0;
+                let right_idx = if arr.len() >= 2 { 1 } else { 0 };
+                (
+                    BufferSamplers::new_f32(arr[left_idx].clone()),
+                    BufferSamplers::new_f32(arr[right_idx].clone()),
+                )
+            }
+            #[cfg(unix)]
+            SampleSource::Streamed { source, io_pool, head, head_start } => {
+                let left_ch = 0;
+                let right_ch = if source.n_chans >= 2 { 1 } else { 0 };
+                // Empty-head fallback ensures register() doesn't panic
+                // when the head_cache missed (e.g. read_head_at failed).
+                let empty: Arc<[i16]> = Arc::from(Vec::new().into_boxed_slice());
+                let head_l = head.get(left_ch).cloned().unwrap_or_else(|| empty.clone());
+                let head_r = head.get(right_ch).cloned().unwrap_or(empty);
+                let left = io_pool.register(
+                    source.clone(), left_ch, head_l, *head_start as usize,
+                );
+                let right = io_pool.register(
+                    source.clone(), right_ch, head_r, *head_start as usize,
+                );
+                (BufferSamplers::streamed(left), BufferSamplers::streamed(right))
+            }
         }
     }
 
-    fn make_sample_grabber<SR: 'static + SampleReader>(
+    fn begin_voice(&self, control: &VoiceControlData, cc_state: &CcState) -> Box<dyn Voice> {
+        let (left_bs, right_bs) = self.build_buffer_samplers();
+        match self.loop_params.mode {
+            LoopMode::LoopContinuous => {
+                let l = SampleReaderLoop::new(left_bs, self.loop_params.clone());
+                let r = SampleReaderLoop::new(right_bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, l, r)
+            }
+            LoopMode::LoopSustain => {
+                let l = SampleReaderLoopSustain::new(left_bs, self.loop_params.clone());
+                let r = SampleReaderLoopSustain::new(right_bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, l, r)
+            }
+            LoopMode::NoLoop | LoopMode::OneShot => {
+                let l = SampleReaderNoLoop::new(left_bs, self.loop_params.clone());
+                let r = SampleReaderNoLoop::new(right_bs, self.loop_params.clone());
+                self.dispatch_interpolator(control, cc_state, l, r)
+            }
+        }
+    }
+
+    fn dispatch_interpolator<SR: 'static + SampleReader>(
         &self,
         control: &VoiceControlData,
         cc_state: &CcState,
-        make_bs: impl Fn(Arc<SampleStorage>) -> SR,
+        left: SR,
+        right: SR,
     ) -> Box<dyn Voice> {
         match self.interpolator {
             Interpolator::Nearest => {
-                self.generate_sampler(control, cc_state, |s| SIMDNearestSampleGrabber::new(make_bs(s)))
+                let l = SIMDNearestSampleGrabber::new(left);
+                let r = SIMDNearestSampleGrabber::new(right);
+                self.generate_sampler_pair(control, cc_state, l, r)
             }
             Interpolator::Linear => {
-                self.generate_sampler(control, cc_state, |s| SIMDLinearSampleGrabber::new(make_bs(s)))
+                let l = SIMDLinearSampleGrabber::new(left);
+                let r = SIMDLinearSampleGrabber::new(right);
+                self.generate_sampler_pair(control, cc_state, l, r)
             }
         }
     }
 
-    fn generate_sampler<SG: 'static + SIMDSampleGrabber<S>>(
+    fn generate_sampler_pair<SG: 'static + SIMDSampleGrabber<S>>(
         &self,
         control: &VoiceControlData,
         cc_state: &CcState,
-        make_sampler: impl Fn(Arc<SampleStorage>) -> SG,
+        left: SG,
+        right: SG,
     ) -> Box<dyn Voice> {
-        let left = make_sampler(self.samples[0].clone());
-        let right = make_sampler(self.samples[1].clone());
-
         let pitch_fac = self.create_pitch_fac(control, cc_state);
-
         let sampler = SIMDStereoVoiceSampler::new(left, right, pitch_fac);
         self.apply_voice_params(sampler, control, cc_state)
     }

@@ -168,6 +168,14 @@ pub(crate) struct RegionParamsBuilder {
     cutoff_curvecc: Vec<(u8, u8)>,
     resonance_curvecc: Vec<(u8, u8)>,
     pan_curvecc: Vec<(u8, u8)>,
+    /// MOVE FORK / 2026-05-16: SFZ keyswitch opcodes. See SfzOpcode docs.
+    /// `sw_last` is the constraint (None = unconstrained). `sw_default`
+    /// is the initial keyswitch state. These inherit through the
+    /// control→global→master→group→region stack like other opcodes.
+    sw_last: Option<i8>,
+    sw_default: Option<i8>,
+    sw_lokey: Option<i8>,
+    sw_hikey: Option<i8>,
 }
 
 impl Default for RegionParamsBuilder {
@@ -235,6 +243,10 @@ impl Default for RegionParamsBuilder {
             cutoff_curvecc: Vec::new(),
             resonance_curvecc: Vec::new(),
             pan_curvecc: Vec::new(),
+            sw_last: None,
+            sw_default: None,
+            sw_lokey: None,
+            sw_hikey: None,
         }
     }
 }
@@ -427,6 +439,14 @@ impl RegionParamsBuilder {
             // parse_sf_root, not into RegionParamsBuilder. Reach here
             // → silently no-op.
             SfzOpcode::CurveIndex(_) | SfzOpcode::CurvePoint(_, _) => {}
+            // MOVE FORK / 2026-05-16: keyswitch opcodes. Inherit through
+            // the SFZ hierarchy like other region fields; the v1 build
+            // pass filters regions whose sw_last doesn't match the
+            // global sw_default.
+            SfzOpcode::SwLast(val)    => self.sw_last    = Some(val),
+            SfzOpcode::SwDefault(val) => self.sw_default = Some(val),
+            SfzOpcode::SwLokey(val)   => self.sw_lokey   = Some(val),
+            SfzOpcode::SwHikey(val)   => self.sw_hikey   = Some(val),
         }
     }
 
@@ -525,6 +545,10 @@ impl RegionParamsBuilder {
             resonance_curvecc: self.resonance_curvecc,
             pan_curvecc: self.pan_curvecc,
             curves,
+            sw_last: self.sw_last,
+            sw_default: self.sw_default,
+            sw_lokey: self.sw_lokey,
+            sw_hikey: self.sw_hikey,
         })
     }
 }
@@ -624,6 +648,15 @@ pub struct RegionParams {
     /// across all regions via Arc — region clones are cheap refcount
     /// bumps. Each curve is a 128-point lookup table.
     pub curves: Arc<HashMap<u8, [f32; 128]>>,
+    /// MOVE FORK / 2026-05-16: keyswitch constraints. `sw_last = Some(K)`
+    /// means this region only fires when the most-recent keyswitch press
+    /// was key K. `sw_default = Some(K)` is the initial keyswitch state
+    /// for the file (typically set in `<global>`). v1: xsynth-core drops
+    /// regions whose sw_last != sw_default at preset build time.
+    pub sw_last: Option<i8>,
+    pub sw_default: Option<i8>,
+    pub sw_lokey: Option<i8>,
+    pub sw_hikey: Option<i8>,
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {

@@ -65,14 +65,54 @@ impl BufferSampler for I16BufferSampler {
     }
 }
 
+// MOVE FORK / 2026-05-16: streamed sample backend. Each voice owns one
+// StreamedBufferSampler per channel (i.e. left+right for stereo). The
+// VoiceStream inside holds an Arc to the shared StreamedSampleSource
+// (resident head buffer + file handle) and an Arc to its own ring buffer
+// that an I/O pool thread fills in the background. The audio thread
+// never blocks on disk: positions < HEAD_FRAMES read from the resident
+// head; later positions read from the ring (underrun → silence).
+#[cfg(unix)]
+pub struct StreamedBufferSampler {
+    stream: crate::soundfont::VoiceStream,
+}
+
+#[cfg(unix)]
+impl StreamedBufferSampler {
+    pub fn new(stream: crate::soundfont::VoiceStream) -> Self {
+        StreamedBufferSampler { stream }
+    }
+}
+
+#[cfg(unix)]
+impl BufferSampler for StreamedBufferSampler {
+    #[inline(always)]
+    fn get(&self, pos: usize) -> f32 {
+        let v = self.stream.get(pos);
+        (v as f32) * I16_TO_F32
+    }
+
+    fn length(&self) -> usize {
+        self.stream.length()
+    }
+}
+
 pub enum BufferSamplers {
     I16(I16BufferSampler),
+    #[cfg(unix)]
+    Streamed(StreamedBufferSampler),
 }
 
 impl BufferSamplers {
     #[inline(always)]
     pub fn new_f32(sample: Arc<SampleStorage>) -> BufferSamplers {
         BufferSamplers::I16(I16BufferSampler(sample))
+    }
+
+    #[cfg(unix)]
+    #[inline(always)]
+    pub fn streamed(stream: crate::soundfont::VoiceStream) -> BufferSamplers {
+        BufferSamplers::Streamed(StreamedBufferSampler::new(stream))
     }
 }
 
@@ -81,12 +121,16 @@ impl BufferSampler for BufferSamplers {
     fn get(&self, pos: usize) -> f32 {
         match self {
             BufferSamplers::I16(sampler) => sampler.get(pos),
+            #[cfg(unix)]
+            BufferSamplers::Streamed(sampler) => sampler.get(pos),
         }
     }
 
     fn length(&self) -> usize {
         match self {
             BufferSamplers::I16(sampler) => sampler.length(),
+            #[cfg(unix)]
+            BufferSamplers::Streamed(sampler) => sampler.length(),
         }
     }
 }

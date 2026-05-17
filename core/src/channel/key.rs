@@ -56,6 +56,33 @@ impl KeyData {
                     // front of the buffer would have the second Off
                     // release the RT instead of the new attack group.
                     self.voices.push_release_trigger_voices(voices, max_layers);
+                } else if self.voices.has_voices() {
+                    // MOVE FORK / 2026-05-16: stuck-note diagnostic.
+                    // NoteOff arrived but no non-releasing voice in the
+                    // buffer means every voice is already releasing or
+                    // killed — so this NoteOff is a no-op. If the user
+                    // hears the note continue ringing, this log entry
+                    // confirms the buffer-full-of-released-voices bug.
+                    #[cfg(unix)]
+                    {
+                        use std::io::Write;
+                        let stats = self.voices.buffer_stats();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let line = format!(
+                            "[xsynth] noteoff no-op key={} t={}ms total={} releasing={} killed={} rt={}\n",
+                            self.key, now, stats.total, stats.releasing, stats.killed, stats.release_trigger,
+                        );
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                        {
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
                 }
             }
             KeyNoteEvent::AllOff => {

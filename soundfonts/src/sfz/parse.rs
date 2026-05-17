@@ -82,6 +82,19 @@ pub enum SfzOpcode {
     Offset(u32),
     Cutoff(f32),
     Resonance(f32),
+    /// MOVE FORK / 2026-05-16: SFZ keyswitch opcodes. `sw_default` is the
+    /// initial keyswitch key for the file; `sw_last` constrains a region
+    /// to fire only when the most-recent keyswitch press matches this key.
+    /// `sw_lokey`/`sw_hikey` define the keyswitch range — keys in that
+    /// range update the "last keyswitch" state instead of triggering
+    /// regions. v1 implementation: regions whose sw_last doesn't match
+    /// sw_default are dropped at preset-build time (no live keyswitching).
+    /// Lets Salamander Grand Piano load without doubling Natural+Retuned
+    /// voices.
+    SwDefault(i8),
+    SwLast(i8),
+    SwLokey(i8),
+    SwHikey(i8),
     AmpKeycenter(i8),
     AmpKeytrack(f32),
     AmpVeltrack(f32),
@@ -562,6 +575,11 @@ fn parse_sfz_opcode(
         "pan" => parse_i8_in_range(val, -100..=100).map(Pan),
         "pitch_keycenter" => parse_key_number(val).map(PitchKeycenter),
         "key" => parse_key_number(val).map(Key),
+        // MOVE FORK / 2026-05-16: keyswitch opcodes (sw_*).
+        "sw_default" => parse_key_number(val).map(SwDefault),
+        "sw_last"    => parse_key_number(val).map(SwLast),
+        "sw_lokey"   => parse_key_number(val).map(SwLokey),
+        "sw_hikey"   => parse_key_number(val).map(SwHikey),
         "cutoff" => parse_float_in_range(val, 1.0..=100000.0).map(Cutoff),
         "resonance" => parse_float_in_range(val, 0.0..=40.0).map(Resonance),
         "amp_keycenter" => parse_key_number(val).map(AmpKeycenter),

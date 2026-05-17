@@ -15,8 +15,9 @@ use thiserror::Error;
 use xsynth_soundfonts::{convert_sample_index, FilterType, LoopMode};
 use xsynth_soundfonts::sfz::TriggerType;
 
+#[cfg(not(unix))]
 use self::audio::load_audio_file;
-pub use self::audio::AudioLoadError;
+pub use self::audio::{prebake_audio_cache, AudioLoadError};
 
 use super::{
     voice::VoiceControlData,
@@ -29,11 +30,16 @@ pub use xsynth_soundfonts::{sf2::Sf2ParseError, sfz::SfzParseError};
 mod audio;
 mod config;
 mod sample_storage;
+#[cfg(unix)]
+mod streaming;
 mod utils;
 mod voice_spawners;
 use utils::*;
 use voice_spawners::*;
 pub use sample_storage::{MmapHolder, SampleStorage};
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use streaming::{IoPool, StreamRing, StreamedSampleSource, VoiceStream, HEAD_FRAMES, RING_FRAMES, take_underrun_count};
 
 pub use config::*;
 
@@ -81,6 +87,60 @@ pub(super) struct LoopParams {
     pub crossfade: u32,
 }
 
+/// MOVE FORK / 2026-05-16: per-region sample backing. Spawners dispatch
+/// on the variant in `begin_voice`:
+///   - `Heap`: full sample channels live in RAM (SF2 path + non-unix
+///     fallback). Voices read directly from `Arc<SampleStorage>`.
+///   - `Streamed`: only the always-resident head buffer is in RAM. The
+///     `StreamedSampleSource` carries the open file handle; each voice
+///     spawn registers a per-voice ring buffer with the `IoPool`. Used
+///     by the SFZ path on unix so libraries larger than RAM (Salamander)
+///     are playable.
+#[derive(Clone)]
+pub(super) enum SampleSource {
+    /// Fully-resident sample channels. Voices clone the outer Arc at
+    /// spawn time and read i16 samples directly via SampleStorage::get.
+    Heap(Arc<[Arc<SampleStorage>]>),
+    /// Disk-streamed sample. `source` is shared across all voices that
+    /// play this sample; each voice gets its own ring buffer registered
+    /// with `io_pool`. `head` is the per-(sample, offset) resident head
+    /// buffer (one Arc<[i16]> per channel) that covers frames
+    /// [head_start, head_start + head_len) of the file. `head_start`
+    /// matches the SFZ region's `offset=` opcode so voices reading at
+    /// file-frame `offset` find their data in RAM immediately.
+    #[cfg(unix)]
+    Streamed {
+        source: Arc<streaming::StreamedSampleSource>,
+        io_pool: Arc<streaming::IoPool>,
+        head: Arc<[Arc<[i16]>]>,
+        head_start: u32,
+    },
+}
+
+impl SampleSource {
+    /// Number of audio channels this source carries (1 = mono, 2 = stereo).
+    /// Spawners check this against stream_params and fan mono → L/R by
+    /// constructing two readers for channel 0 when needed.
+    pub fn n_chans(&self) -> usize {
+        match self {
+            SampleSource::Heap(arr) => arr.len(),
+            #[cfg(unix)]
+            SampleSource::Streamed { source, .. } => source.n_chans,
+        }
+    }
+}
+
+/// MOVE FORK / 2026-05-16: zero-filled per-channel head fallback. Used
+/// when read_head_at fails (e.g. file IO error). Voice gets silence at
+/// the start rather than crashing.
+#[cfg(unix)]
+fn zero_heads(n_chans: usize) -> Arc<[Arc<[i16]>]> {
+    let v: Vec<Arc<[i16]>> = (0..n_chans)
+        .map(|_| Arc::from(Vec::new().into_boxed_slice()))
+        .collect();
+    Arc::from(v.into_boxed_slice())
+}
+
 struct SampleVoiceSpawnerParams {
     volume: f32,
     pan: f32,
@@ -96,7 +156,7 @@ struct SampleVoiceSpawnerParams {
     filter_type: FilterType,
     loop_params: LoopParams,
     envelope: Arc<EnvelopeParameters>,
-    sample: Arc<[Arc<SampleStorage>]>,
+    sample: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
     /// MOVE FORK: SFZ round-robin position (1-based) within an RR set.
@@ -271,6 +331,14 @@ pub(super) struct RrState {
 pub struct SampleSoundfont {
     instruments: Vec<SoundfontInstrument>,
     stream_params: AudioStreamParams,
+    /// MOVE FORK / 2026-05-17: max absolute f32 amplitude across all
+    /// per-region head buffers, factoring in each region's `volume`
+    /// multiplier. Used by the C plugin to compute a per-preset
+    /// attenuation that brings hot SFZ libraries (Salamander piano:
+    /// per-voice peak ≈ 0.82) into the same loudness ballpark as
+    /// DecentSampler without forcing the user to manage per-preset
+    /// gain knobs.
+    estimated_voice_peak: f32,
 }
 
 /// Errors that can be generated when loading an SFZ soundfont.
@@ -370,6 +438,30 @@ impl SampleSoundfont {
         check_cancel()?;
         let regions = xsynth_soundfonts::sfz::parse_soundfont(sfz_path)?;
 
+        // MOVE FORK / 2026-05-16: SFZ keyswitch v1 filter. The SFZ spec's
+        // `sw_default` sets the initial keyswitch key for the file;
+        // `sw_last` on a region constrains it to fire only when the
+        // most-recent keyswitch press matches that key. We don't yet
+        // track live keyswitch state per channel, so for now: pick the
+        // first sw_default seen, drop any region whose sw_last is set
+        // and doesn't match it. Lets Salamander Grand Piano load with
+        // only the Natural master active (the Retuned master's regions
+        // are tagged sw_last=$RETUNED and get filtered out).
+        let effective_keyswitch: Option<i8> = regions
+            .iter()
+            .find_map(|r| r.sw_default);
+        let regions: Vec<_> = if let Some(ks) = effective_keyswitch {
+            regions
+                .into_iter()
+                .filter(|r| match r.sw_last {
+                    Some(last) => last == ks,
+                    None => true,
+                })
+                .collect()
+        } else {
+            regions
+        };
+
         // Find the unique samples that we need to parse and convert
         let unique_sample_params: HashSet<_> = regions
             .iter()
@@ -382,15 +474,117 @@ impl SampleSoundfont {
         // the process via Rust's alloc handler on our ~1.5 GB device. Serial
         // load keeps peak well under budget; render-time rayon parallelism
         // is untouched.
-        let samples: Result<HashMap<_, _>, _> = unique_sample_params
-            .into_iter()
-            .map(|params| -> Result<(_, _), LoadSfzError> {
+        //
+        // MOVE FORK / 2026-05-16: on unix we always go disk-streamed —
+        // memory cost is bounded to the head buffer (~1 s per sample
+        // per unique region.offset) plus active voice rings. Heap
+        // residency is structurally unsupportable for libraries like
+        // Salamander Grand Piano (~1.1 GB decoded i16). The IoPool is
+        // per-soundfont; it lives in the SampleSource::Streamed Arc
+        // carried by every spawner, so it goes away when the last
+        // spawner drops.
+        #[cfg(unix)]
+        let io_pool: Arc<streaming::IoPool> = streaming::IoPool::new();
+
+        // Phase A: load each unique sample's metadata (file handle +
+        // layout). On unix this is the streamed source; on other
+        // platforms it's a heap-loaded Arc<[Arc<SampleStorage>]>.
+        let total_samples_count = unique_sample_params.len();
+        let progress_start = std::time::Instant::now();
+        let mut samples_loaded: usize = 0;
+
+        #[cfg(unix)]
+        let mut sources: HashMap<_, (Arc<streaming::StreamedSampleSource>, u32)> =
+            HashMap::with_capacity(total_samples_count);
+        #[cfg(not(unix))]
+        let mut heap_samples: HashMap<_, (Arc<[Arc<SampleStorage>]>, u32)> =
+            HashMap::with_capacity(total_samples_count);
+
+        for params in unique_sample_params.iter() {
+            check_cancel()?;
+            #[cfg(unix)]
+            {
+                let (source, rate) =
+                    audio::load_audio_file_streamed(&params.path, stream_params)?;
+                sources.insert(params.clone(), (source, rate));
+            }
+            #[cfg(not(unix))]
+            {
+                let (channels, rate) = load_audio_file(&params.path, stream_params)?;
+                heap_samples.insert(params.clone(), (channels, rate));
+            }
+            samples_loaded += 1;
+            if samples_loaded == 1
+                || samples_loaded == total_samples_count
+                || samples_loaded % 16 == 0
+            {
+                let elapsed = progress_start.elapsed().as_secs_f64();
+                let eta = if samples_loaded > 0 {
+                    elapsed * (total_samples_count - samples_loaded) as f64
+                        / samples_loaded as f64
+                } else {
+                    0.0
+                };
+                let line = format!(
+                    "[xsynth] sample load: {}/{} elapsed={:.1}s eta={:.1}s last={}\n",
+                    samples_loaded,
+                    total_samples_count,
+                    elapsed,
+                    eta,
+                    params.path.display(),
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
+
+        // Phase B (unix only): pre-load per-(sample, region.offset)
+        // head buffers. SFZ regions can carry an `offset=N` opcode that
+        // skips N frames of the source file. Voices reading at file
+        // position N need the head buffer to start at N — not at frame
+        // 0 — so the audio thread doesn't hit an empty ring on noteon.
+        // Heads dedupe across regions sharing the same (path, offset)
+        // pair. RAM per head: HEAD_FRAMES × n_chans × 2 bytes.
+        #[cfg(unix)]
+        let head_cache: HashMap<_, Arc<[Arc<[i16]>]>> = {
+            use std::collections::HashSet;
+            let mut head_keys: HashSet<_> = HashSet::new();
+            for region in &regions {
+                let key = sample_cache_from_region_params(region);
+                let src_rate = sources.get(&key).map(|(_, r)| *r)
+                    .unwrap_or(stream_params.sample_rate);
+                // Convert SFZ source-rate offset to target-rate (matches
+                // .x44c cache frame layout + BufferSampler::get(pos)).
+                let target_offset = convert_sample_index(
+                    region.offset,
+                    src_rate,
+                    stream_params.sample_rate,
+                );
+                head_keys.insert((key, target_offset));
+            }
+            let mut map = HashMap::with_capacity(head_keys.len());
+            for (key, target_offset) in head_keys {
                 check_cancel()?;
-                let sample = load_audio_file(&params.path, stream_params)?;
-                Ok((params, sample))
-            })
-            .collect();
-        let samples = samples?;
+                if let Some(src) = sources.get(&key).map(|(s, _)| s.clone()) {
+                    let head = src
+                        .read_head_at(target_offset as usize)
+                        .unwrap_or_else(|| {
+                            (0..src.n_chans)
+                                .map(|_| Arc::from(Vec::new().into_boxed_slice()))
+                                .collect()
+                        });
+                    let head_arc: Arc<[Arc<[i16]>]> = Arc::from(head.into_boxed_slice());
+                    map.insert((key, target_offset), head_arc);
+                }
+            }
+            map
+        };
 
         // Generate region params. MOVE FORK: parallel attack + release lists.
         let mut spawner_params_list = Vec::<Vec<Arc<SampleVoiceSpawnerParams>>>::new();
@@ -485,7 +679,10 @@ impl SampleSoundfont {
                     let vol_db = (region.volume as f32 + vol_db_add).clamp(-96.0, 12.0);
                     let volume = vol_mult * db_to_amp(vol_db);
 
-                    let sample_rate = samples[&params].1;
+                    #[cfg(unix)]
+                    let sample_rate = sources[&params].1;
+                    #[cfg(not(unix))]
+                    let sample_rate = heap_samples[&params].1;
 
                     let loop_params = LoopParams {
                         mode: if region.loop_start == region.loop_end {
@@ -517,11 +714,34 @@ impl SampleSoundfont {
                             * stream_params.sample_rate as f32) as u32,
                     };
 
-                    let mut region_samples = samples[&params].0.clone();
-                    if stream_params.channels == ChannelCount::Stereo && region_samples.len() == 1 {
-                        region_samples =
-                            Arc::new([region_samples[0].clone(), region_samples[0].clone()]);
-                    }
+                    // MOVE FORK / 2026-05-16: per-region sample backing.
+                    // Heap: clone the Arc<[Arc<SampleStorage>]>; fan mono
+                    // to stereo via Arc duplication. Streamed: clone the
+                    // (source, io_pool, per-(path,offset) head, head_start).
+                    // The mono→stereo fan-out happens at voice-spawn time.
+                    #[cfg(unix)]
+                    let region_samples: SampleSource = {
+                        let (src, _) = &sources[&params];
+                        let target_offset = loop_params.offset;
+                        let head = head_cache
+                            .get(&(params.clone(), target_offset))
+                            .cloned()
+                            .unwrap_or_else(|| zero_heads(src.n_chans));
+                        SampleSource::Streamed {
+                            source: src.clone(),
+                            io_pool: io_pool.clone(),
+                            head,
+                            head_start: target_offset,
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let region_samples: SampleSource = {
+                        let mut a = heap_samples[&params].0.clone();
+                        if stream_params.channels == ChannelCount::Stereo && a.len() == 1 {
+                            a = Arc::new([a[0].clone(), a[0].clone()]);
+                        }
+                        SampleSource::Heap(a)
+                    };
 
                     let spawner_params = Arc::new(SampleVoiceSpawnerParams {
                         pan,
@@ -607,6 +827,46 @@ impl SampleSoundfont {
             })
             .collect();
 
+        // MOVE FORK / 2026-05-17: per-preset peak estimate for auto-gain.
+        // For each spawner_params (one per region × key × vel slot),
+        // estimate worst-case voice peak = sample_peak × params.volume.
+        // The plugin uses this to compute a per-preset attenuation
+        // that brings hot SFZ libs into the same loudness ballpark as
+        // DecentSampler.
+        //
+        // For streamed sources, sample peak is read from the resident
+        // head buffer (first ~1 s of each sample, which covers piano
+        // attacks). For heap sources, scan the full Arc<[i16]> data.
+        #[cfg(unix)]
+        let estimated_voice_peak: f32 = {
+            let mut max_peak: f32 = 0.0;
+            for slot in spawner_params_list.iter().chain(release_spawner_params_list.iter()) {
+                for sp in slot.iter() {
+                    let sample_peak_i16: i16 = match &sp.sample {
+                        SampleSource::Streamed { head, .. } => head
+                            .iter()
+                            .flat_map(|ch| ch.iter().copied())
+                            .map(|v| v.unsigned_abs() as i16)
+                            .max()
+                            .unwrap_or(0),
+                        SampleSource::Heap(arr) => arr
+                            .iter()
+                            .flat_map(|ch| (0..ch.len()).map(|i| ch.get(i).unsigned_abs() as i16))
+                            .max()
+                            .unwrap_or(0),
+                    };
+                    let sample_peak_f32 = sample_peak_i16 as f32 / 32768.0;
+                    let voice_peak = sample_peak_f32 * sp.volume.abs();
+                    if voice_peak > max_peak {
+                        max_peak = voice_peak;
+                    }
+                }
+            }
+            max_peak
+        };
+        #[cfg(not(unix))]
+        let estimated_voice_peak: f32 = 1.0; // Be conservative on non-unix builds.
+
         Ok(SampleSoundfont {
             instruments: vec![SoundfontInstrument {
                 bank: options.bank.unwrap_or(0),
@@ -616,6 +876,7 @@ impl SampleSoundfont {
                 rr_state,
             }],
             stream_params,
+            estimated_voice_peak,
         })
     }
 
@@ -743,7 +1004,13 @@ impl SampleSoundfont {
                             filter_type: FilterType::LowPass,
                             interpolator: options.interpolator,
                             loop_params,
-                            sample: sample_storage,
+                            // MOVE FORK / 2026-05-16: SF2 stays heap-resident.
+                            // Its sample data is unpacked from one big binary
+                            // blob at load time and doesn't have the per-sample
+                            // file structure that the streaming path requires.
+                            // SF2 isn't used by schwung-sfz anyway; this is
+                            // upstream-compat plumbing.
+                            sample: SampleSource::Heap(sample_storage),
                             exclusive_class: region.exclusive_class,
                             seq_position: 0, // SF2 has no round-robin concept
                             // SF2 has no `_oncc` surface; empty Arcs.
@@ -798,7 +1065,19 @@ impl SampleSoundfont {
         Ok(SampleSoundfont {
             instruments,
             stream_params,
+            // SF2 isn't used by schwung-sfz today; pick a safe default
+            // that disables auto-gain (1.0 = no attenuation, plugin
+            // computes preset_attenuation = 1.0 below threshold).
+            estimated_voice_peak: 0.5,
         })
+    }
+
+    /// MOVE FORK / 2026-05-17: max absolute f32 amplitude any single
+    /// voice can produce in this preset (sample_peak × region.volume).
+    /// The plugin uses this to derive a per-preset attenuation so hot
+    /// SFZ libraries don't dominate user mixing.
+    pub fn estimated_voice_peak(&self) -> f32 {
+        self.estimated_voice_peak
     }
 }
 

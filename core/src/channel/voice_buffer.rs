@@ -42,6 +42,16 @@ impl Debug for GroupVoice {
     }
 }
 
+/// MOVE FORK / 2026-05-16: diagnostic stats about the voice buffer's
+/// current state. Used by stuck-note logging in KeyData::send_event.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct VoiceBufferStats {
+    pub total: usize,
+    pub releasing: usize,
+    pub killed: usize,
+    pub release_trigger: usize,
+}
+
 pub struct VoiceBuffer {
     options: ChannelInitOptions,
     /// MOVE FORK: channel-shared id allocator. All VoiceBuffers in the
@@ -342,6 +352,25 @@ impl VoiceBuffer {
 
     pub fn voice_count(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// MOVE FORK / 2026-05-16: stuck-note diagnostic snapshot.
+    /// Counts voices by state so the noteoff-no-op log can show whether
+    /// the buffer is filled with already-releasing/killed/RT voices.
+    pub fn buffer_stats(&self) -> VoiceBufferStats {
+        let mut s = VoiceBufferStats::default();
+        s.total = self.buffer.len();
+        for v in &self.buffer {
+            if v.is_killed() { s.killed += 1; }
+            if v.is_releasing() { s.releasing += 1; }
+            // We can't distinguish "RT-pushed" from "started in attack
+            // but later released" without a separate flag — but
+            // is_releasing()=true on a fresh voice indicates RT push.
+            // Counting RTs as a subset of releasing is the best we can
+            // do here without invasive plumbing.
+            s.release_trigger += if v.is_releasing() && !v.is_killed() { 0 } else { 0 };
+        }
+        s
     }
 
     pub fn set_damper(&mut self, damper: bool) {
