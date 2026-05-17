@@ -577,6 +577,19 @@ impl SampleSoundfont {
                 // Region's required head length: HEAD_FRAMES for plain
                 // play-through, OR loop_end - target_offset for looped
                 // regions so the loop region itself is fully resident.
+                //
+                // MOVE FORK / 2026-05-17: cap the loop-extension at
+                // LOOP_HEAD_MAX_FRAMES (~4 s) so granular / pad libraries
+                // with loop_end near the sample's full length don't
+                // allocate hundreds of MB of head buffers and thrash the
+                // page cache (Raw Violin: loop_end = 3,962,652 frames =
+                // ~15 MB per head per channel). For loops bigger than
+                // this cap, the loop-wrap underrun returns silence for
+                // the brief window before the I/O pool re-fills — a
+                // single audible artifact per loop iteration, much
+                // better than freezing the whole device on preset
+                // load.
+                const LOOP_HEAD_MAX_FRAMES: usize = 176400; // ~4 s @ 44.1k
                 let mut needed = streaming::HEAD_FRAMES;
                 let region_loops = region.loop_start != region.loop_end
                     && matches!(region.loop_mode,
@@ -589,16 +602,27 @@ impl SampleSoundfont {
                     ) as usize;
                     if loop_end_target > target_offset as usize {
                         let span = loop_end_target - target_offset as usize + 1;
-                        if span > needed { needed = span; }
+                        let capped = span.min(LOOP_HEAD_MAX_FRAMES);
+                        if capped > needed { needed = capped; }
                     }
                 }
                 let entry = head_lens.entry((key, target_offset)).or_insert(0);
                 if needed > *entry { *entry = needed; }
             }
             let mut map = HashMap::with_capacity(head_lens.len());
+            // MOVE FORK / 2026-05-17: Phase B (head decode) heartbeat log.
+            // Phase A (file open + metadata) is already logged; Phase B
+            // can take minutes on libraries with thousands of regions
+            // and is where load-freezes have been seen (Salamander).
+            // Log every 16 heads with elapsed + last path so a freeze
+            // shows which sample/offset is in flight.
+            let head_total = head_lens.len();
+            let head_start_t = std::time::Instant::now();
+            let mut heads_done: usize = 0;
             for ((key, target_offset), head_len) in head_lens {
                 check_cancel()?;
                 if let Some(src) = sources.get(&key).map(|(s, _)| s.clone()) {
+                    let path_display = key.path.display().to_string();
                     let head = src
                         .read_head_at_len(target_offset as usize, head_len)
                         .unwrap_or_else(|| {
@@ -608,6 +632,28 @@ impl SampleSoundfont {
                         });
                     let head_arc: Arc<[Arc<[i16]>]> = Arc::from(head.into_boxed_slice());
                     map.insert((key, target_offset), head_arc);
+                    heads_done += 1;
+                    if heads_done == 1
+                        || heads_done == head_total
+                        || heads_done % 16 == 0
+                    {
+                        let elapsed = head_start_t.elapsed().as_secs_f64();
+                        let eta = if heads_done > 0 {
+                            elapsed * (head_total - heads_done) as f64 / heads_done as f64
+                        } else { 0.0 };
+                        let line = format!(
+                            "[xsynth] head load: {}/{} elapsed={:.1}s eta={:.1}s head_len={} target_offset={} last={}\n",
+                            heads_done, head_total, elapsed, eta,
+                            head_len, target_offset, path_display,
+                        );
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                        {
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                    }
                 }
             }
             map
