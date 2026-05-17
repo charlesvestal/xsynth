@@ -34,6 +34,16 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::{Decoder, DecoderOptions};
+use symphonia::core::conv::IntoSample;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::sample::Sample;
+
 /// MOVE FORK / 2026-05-16: process-global underrun counter. Every time a
 /// VoiceStream::get() falls past the head buffer and hits an unfilled
 /// ring slot, this counter ticks. Audio glitches under chord-burst spawn
@@ -223,13 +233,157 @@ impl StreamedSampleSource {
                     heads.push(Arc::from(buf.into_boxed_slice()));
                 }
             }
-            SampleLayout::Flac { .. } => {
-                // TODO (day 2): per-sample FLAC decoder to read head.
-                // For now, return None — caller falls back to zero-head.
-                return None;
+            SampleLayout::Flac { path } => {
+                // Open a fresh per-call symphonia decoder. Heads are read
+                // once at SFZ load time, so the cost of decoder setup is
+                // amortized across the preset lifetime.
+                let (mut format, mut decoder, track_id) =
+                    open_flac_decoder(path)?;
+                // Seek to frame_offset. Symphonia's FLAC reader supports
+                // accurate seeks; actual_ts may land before required_ts
+                // and we skip leading samples until aligned.
+                let seeked = format
+                    .seek(
+                        SeekMode::Accurate,
+                        SeekTo::TimeStamp {
+                            ts: frame_offset as u64,
+                            track_id,
+                        },
+                    )
+                    .ok()?;
+                let mut cur_frame = seeked.actual_ts as usize;
+                let target_start = frame_offset;
+                let target_end = frame_offset + head_len;
+                let mut per_chan: Vec<Vec<i16>> =
+                    (0..self.n_chans).map(|_| Vec::with_capacity(head_len)).collect();
+                while cur_frame < target_end {
+                    let packet = match format.next_packet() {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if packet.track_id() != track_id {
+                        continue;
+                    }
+                    let audio = match decoder.decode(&packet) {
+                        Ok(a) => a,
+                        Err(SymphoniaError::DecodeError(_)) => continue,
+                        Err(_) => break,
+                    };
+                    let packet_frames = packet_frame_count(&audio);
+                    let packet_start = cur_frame;
+                    let packet_end = packet_start + packet_frames;
+                    // Window: intersect [packet_start, packet_end) with [target_start, target_end).
+                    let copy_from = target_start.max(packet_start);
+                    let copy_to = target_end.min(packet_end);
+                    if copy_from < copy_to {
+                        let local_start = copy_from - packet_start;
+                        let local_end = copy_to - packet_start;
+                        for c in 0..self.n_chans {
+                            extract_packet_channel_i16(
+                                &audio, c, local_start, local_end, &mut per_chan[c],
+                            );
+                        }
+                    }
+                    cur_frame = packet_end;
+                }
+                for c in 0..self.n_chans {
+                    if per_chan[c].len() < head_len {
+                        // Short read (EOF or decode error mid-head). Pad
+                        // with silence so the voice still gets a fault-
+                        // free starting window.
+                        per_chan[c].resize(head_len, 0);
+                    } else if per_chan[c].len() > head_len {
+                        per_chan[c].truncate(head_len);
+                    }
+                    heads.push(Arc::from(per_chan[c].clone().into_boxed_slice()));
+                }
             }
         }
         Some(heads)
+    }
+}
+
+/// MOVE FORK / 2026-05-17 (day 2): open a fresh symphonia FLAC format
+/// reader + decoder pointed at `path`. Each voice's ring gets its own
+/// decoder so seek state doesn't collide. Used by both the head-read
+/// path (one-shot per load) and the I/O pool's per-ring refill loop.
+fn open_flac_decoder(
+    path: &std::path::Path,
+) -> Option<(Box<dyn FormatReader>, Box<dyn Decoder>, u32)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let format = probed.format;
+    let (track_id, codec_params) = {
+        let track = format.default_track()?;
+        (track.id, track.codec_params.clone())
+    };
+    let decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .ok()?;
+    Some((format, decoder, track_id))
+}
+
+/// Frame count of a decoded audio buffer ref.
+fn packet_frame_count(buf: &AudioBufferRef) -> usize {
+    match buf {
+        AudioBufferRef::U8(b) => b.chan(0).len(),
+        AudioBufferRef::U16(b) => b.chan(0).len(),
+        AudioBufferRef::U24(b) => b.chan(0).len(),
+        AudioBufferRef::U32(b) => b.chan(0).len(),
+        AudioBufferRef::S8(b) => b.chan(0).len(),
+        AudioBufferRef::S16(b) => b.chan(0).len(),
+        AudioBufferRef::S24(b) => b.chan(0).len(),
+        AudioBufferRef::S32(b) => b.chan(0).len(),
+        AudioBufferRef::F32(b) => b.chan(0).len(),
+        AudioBufferRef::F64(b) => b.chan(0).len(),
+    }
+}
+
+/// Append `[local_start..local_end)` of channel `c` from `buf` (converted
+/// to i16) to `out`. Sample-format-agnostic via Symphonia's IntoSample.
+fn extract_packet_channel_i16(
+    buf: &AudioBufferRef,
+    c: usize,
+    local_start: usize,
+    local_end: usize,
+    out: &mut Vec<i16>,
+) {
+    fn push<S: Sample + IntoSample<i16>>(
+        chan: &[S],
+        local_start: usize,
+        local_end: usize,
+        out: &mut Vec<i16>,
+    ) {
+        let end = local_end.min(chan.len());
+        if local_start >= end {
+            return;
+        }
+        out.reserve(end - local_start);
+        for &s in &chan[local_start..end] {
+            out.push(s.into_sample());
+        }
+    }
+    match buf {
+        AudioBufferRef::U8(b)  => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::U16(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::U24(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::U32(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::S8(b)  => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::S16(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::S24(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::S32(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::F32(b) => push(b.chan(c), local_start, local_end, out),
+        AudioBufferRef::F64(b) => push(b.chan(c), local_start, local_end, out),
     }
 }
 
@@ -443,11 +597,35 @@ impl VoiceStream {
 // I/O Pool
 // =============================================================================
 
+/// MOVE FORK / 2026-05-17 (day 2): per-ring FLAC decoder state.
+/// One symphonia format reader + decoder per ring (one ring = one
+/// channel of one voice), constructed lazily on first refill so registration
+/// is cheap. Pending buffer absorbs leftover samples when a decoded packet
+/// is larger than the refill budget; reused on the next refill.
+struct FlacRingState {
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn Decoder>,
+    track_id: u32,
+    /// Absolute file frame where the decoder will deliver its NEXT
+    /// packet's first sample. Tracked separately from `pending_start`
+    /// because the decoder advances by full packets (variable size),
+    /// while `pending_start` advances by what we've written to the ring.
+    decoder_cursor: usize,
+    /// i16 samples for THIS ring's channel that have been decoded but not
+    /// yet written to the ring. `pending[0]` corresponds to absolute file
+    /// frame `pending_start`.
+    pending: Vec<i16>,
+    pending_start: usize,
+}
+
 /// One ring registration in the pool's working set.
 struct RegisteredRing {
     source: Arc<StreamedSampleSource>,
     channel: usize,
     ring: Weak<StreamRing>,
+    /// Per-ring FLAC decoder, lazily initialized on first refill iff the
+    /// source layout is Flac. None for WAV/Separated layouts.
+    flac_state: Option<FlacRingState>,
 }
 
 enum PoolCommand {
@@ -512,6 +690,7 @@ impl IoPool {
             source: source.clone(),
             channel,
             ring: Arc::downgrade(&ring),
+            flac_state: None,
         };
         let idx = self.next_worker.fetch_add(1, Ordering::Relaxed)
             % self.tx_workers.len();
@@ -558,7 +737,7 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
         let mut did_work = false;
         let mut i = 0;
         while i < working_set.len() {
-            let r = &working_set[i];
+            let r = &mut working_set[i];
             let Some(ring) = r.ring.upgrade() else {
                 // Voice dropped — remove from working set.
                 working_set.swap_remove(i);
@@ -592,6 +771,23 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
 
             let budget = ring.refill_budget().min(frames_remaining);
             if budget == 0 {
+                i += 1;
+                continue;
+            }
+
+            // FLAC streams write to the ring directly through their own
+            // helper (per-ring decoder state, packet-driven copy). Other
+            // layouts use the shared scratch + write_chunk plumbing
+            // below.
+            if matches!(r.source.layout, SampleLayout::Flac { .. }) {
+                let (wrote, hit_eof) =
+                    refill_flac_ring(r, &ring, write_pos, budget);
+                if wrote > 0 {
+                    did_work = true;
+                }
+                if hit_eof {
+                    ring.set_eof();
+                }
                 i += 1;
                 continue;
             }
@@ -648,9 +844,8 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
                     }
                 }
                 SampleLayout::Flac { .. } => {
-                    // TODO (day 2): per-ring symphonia FLAC decoder.
-                    // For now, treat as EOF — voice gets silence.
-                    None
+                    // Handled by the early-return refill_flac_ring path above.
+                    unreachable!()
                 }
             };
             match read_result {
@@ -685,6 +880,97 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
             thread::sleep(Duration::from_millis(2));
         }
     }
+}
+
+/// MOVE FORK / 2026-05-17 (day 2): FLAC ring refill. Lazily opens a
+/// per-ring symphonia decoder on first call, seeks to `write_pos`, then
+/// decodes packets and copies the requested channel into the ring.
+/// Leftover decoded samples beyond `budget` stay in `pending` for the
+/// next refill so packet boundaries don't force per-call decoder churn.
+///
+/// Returns (frames written, hit_eof).
+fn refill_flac_ring(
+    r: &mut RegisteredRing,
+    ring: &StreamRing,
+    write_pos: usize,
+    budget: usize,
+) -> (usize, bool) {
+    // Pull the FLAC path out of the source's layout. Caller guarantees
+    // layout is Flac; anything else is a programmer error.
+    let path = match &r.source.layout {
+        SampleLayout::Flac { path } => path.clone(),
+        _ => return (0, true),
+    };
+    let channel = r.channel;
+
+    // Lazy init: open decoder + seek on first refill. Cost (~1-5 ms per
+    // ring) is paid once on the I/O thread, never on the audio thread.
+    if r.flac_state.is_none() {
+        let Some((mut format, decoder, track_id)) = open_flac_decoder(&path) else {
+            return (0, true);
+        };
+        let seeked = match format.seek(
+            SeekMode::Accurate,
+            SeekTo::TimeStamp { ts: write_pos as u64, track_id },
+        ) {
+            Ok(s) => s,
+            Err(_) => return (0, true),
+        };
+        r.flac_state = Some(FlacRingState {
+            format,
+            decoder,
+            track_id,
+            decoder_cursor: seeked.actual_ts as usize,
+            pending: Vec::new(),
+            pending_start: write_pos,
+        });
+    }
+    let state = r.flac_state.as_mut().unwrap();
+
+    let mut hit_eof = false;
+    while state.pending.len() < budget {
+        let packet = match state.format.next_packet() {
+            Ok(p) => p,
+            Err(_) => { hit_eof = true; break; }
+        };
+        if packet.track_id() != state.track_id {
+            continue;
+        }
+        // DecodeError leaves the packet's intrinsic length unknown, which
+        // would break decoder_cursor accounting for subsequent packets.
+        // Treat any decode failure as a hard stop (rare; audible only as
+        // truncated tail, never as a drift glitch).
+        let audio = match state.decoder.decode(&packet) {
+            Ok(a) => a,
+            Err(_) => { hit_eof = true; break; }
+        };
+        let pf = packet_frame_count(&audio);
+        let packet_start = state.decoder_cursor;
+        let packet_end = packet_start + pf;
+        state.decoder_cursor = packet_end;
+
+        // Where we want the next pending sample to land in absolute file
+        // frames. After init this is `write_pos` (since pending is empty
+        // and pending_start = write_pos); grows by packet contributions.
+        let desired = state.pending_start + state.pending.len();
+        if desired >= packet_end {
+            // Packet is entirely before what we want — skip leading
+            // samples that fell out of an Accurate seek's bracket.
+            continue;
+        }
+        let local_start = desired.saturating_sub(packet_start);
+        extract_packet_channel_i16(
+            &audio, channel, local_start, pf, &mut state.pending,
+        );
+    }
+
+    let take = budget.min(state.pending.len());
+    if take > 0 {
+        ring.write_chunk(&state.pending[..take]);
+        state.pending.drain(..take);
+        state.pending_start += take;
+    }
+    (take, hit_eof)
 }
 
 // =============================================================================
@@ -859,6 +1145,156 @@ mod tests {
             assert_eq!(v, fixture_value(0, pos), "voice read at pos {}", pos);
             vs.ring.mark_consumed(pos);
         }
+    }
+
+    /// MOVE FORK / 2026-05-17 (day 2): build a synthetic FLAC file
+    /// large enough to exercise BOTH the head buffer (44100 frames) and
+    /// the post-head ring refill path. Generated via the `flac` CLI
+    /// (homebrew on Mac / apt on Linux) from a raw PCM stream. Skipped
+    /// if `flac` isn't on PATH.
+    fn build_test_flac() -> Option<(std::path::PathBuf, Vec<i16>)> {
+        // 2.5 seconds of mono 44.1 kHz @ 16-bit = 110250 frames.
+        let frames: usize = 110_250;
+        let mut samples = Vec::with_capacity(frames);
+        for f in 0..frames {
+            // Deterministic content: sine + per-sample-distinct index
+            // so off-by-one comparison failures are visible.
+            let t = (f as f32 / 44100.0) * 2.0 * std::f32::consts::PI * 440.0;
+            let v = (t.sin() * 0.5 * 32767.0) as i16;
+            // XOR in the low bits of the frame index so consecutive
+            // samples differ even when sin returns the same value.
+            samples.push(v ^ ((f as i16) & 0x0F));
+        }
+
+        let wav = tempfile_path("xsynth-flac-test-wav");
+        let flac = wav.with_extension("flac");
+        // Write WAV header + data manually (canonical PCM/16-bit/mono).
+        {
+            let mut f = File::create(&wav).ok()?;
+            let data_bytes: u32 = (frames * 2) as u32;
+            let header: Vec<u8> = {
+                let mut h = Vec::with_capacity(44);
+                h.extend_from_slice(b"RIFF");
+                h.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+                h.extend_from_slice(b"WAVE");
+                h.extend_from_slice(b"fmt ");
+                h.extend_from_slice(&16u32.to_le_bytes());
+                h.extend_from_slice(&1u16.to_le_bytes());   // PCM
+                h.extend_from_slice(&1u16.to_le_bytes());   // mono
+                h.extend_from_slice(&44100u32.to_le_bytes());
+                h.extend_from_slice(&(44100u32 * 2).to_le_bytes()); // byte rate
+                h.extend_from_slice(&2u16.to_le_bytes());   // block align
+                h.extend_from_slice(&16u16.to_le_bytes());  // bits per sample
+                h.extend_from_slice(b"data");
+                h.extend_from_slice(&data_bytes.to_le_bytes());
+                h
+            };
+            f.write_all(&header).ok()?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(samples.as_ptr() as *const u8, frames * 2)
+            };
+            f.write_all(bytes).ok()?;
+        }
+
+        // Invoke `flac` to compress.
+        let status = std::process::Command::new("flac")
+            .arg("--silent")
+            .arg("--force")
+            .arg("--no-padding")
+            .arg("-o").arg(&flac)
+            .arg(&wav)
+            .status()
+            .ok()?;
+        let _ = std::fs::remove_file(&wav);
+        if !status.success() {
+            return None;
+        }
+        Some((flac, samples))
+    }
+
+    /// MOVE FORK / 2026-05-17 (day 2): smoke test the FLAC streaming
+    /// path end-to-end. Generates a synthetic 110k-frame FLAC at load
+    /// time, then verifies:
+    ///   1. read_head_at(0) returns HEAD_FRAMES samples matching source
+    ///   2. IoPool refills the ring past the head boundary
+    ///   3. post-head ring samples match the source
+    ///
+    /// Skipped if the `flac` CLI is not installed on the test host.
+    #[cfg(unix)]
+    #[test]
+    fn flac_stream_smoke() {
+        let Some((path, reference)) = build_test_flac() else {
+            eprintln!("flac_stream_smoke: flac CLI unavailable, skipping");
+            return;
+        };
+
+        assert!(reference.len() > HEAD_FRAMES,
+            "test fixture must exceed HEAD_FRAMES to exercise ring refill: {} <= {}",
+            reference.len(), HEAD_FRAMES);
+
+        let (sr, n_chans, n_frames) = {
+            let (format, _decoder, _id) =
+                open_flac_decoder(&path).expect("probe");
+            let track = format.default_track().unwrap();
+            (
+                track.codec_params.sample_rate.unwrap(),
+                track.codec_params.channels.unwrap().count(),
+                track.codec_params.n_frames.unwrap() as usize,
+            )
+        };
+        assert_eq!(sr, 44100);
+        assert_eq!(n_chans, 1);
+        assert_eq!(n_frames, reference.len());
+
+        let file = std::fs::File::open(&path).unwrap();
+        let source = Arc::new(StreamedSampleSource {
+            file: Arc::new(file),
+            layout: SampleLayout::Flac { path: path.clone() },
+            frames: n_frames,
+            n_chans,
+            src_rate: sr,
+        });
+
+        // Head read at frame 0: must match reference for [0, HEAD_FRAMES).
+        let heads = source.read_head_at(0).expect("read_head_at");
+        assert_eq!(heads.len(), n_chans);
+        assert_eq!(heads[0].len(), HEAD_FRAMES);
+        for i in 0..HEAD_FRAMES {
+            assert_eq!(
+                heads[0][i], reference[i],
+                "head sample {} mismatch", i,
+            );
+        }
+
+        // Register the ring and let the pool refill past HEAD_FRAMES.
+        let pool = IoPool::new();
+        let vs = pool.register(source.clone(), 0, heads[0].clone(), 0);
+        let head_end = HEAD_FRAMES;
+        let want_frames = (head_end + 8192).min(n_frames);
+        assert!(want_frames > head_end,
+            "test fixture too small to exercise post-head ring");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
+        while std::time::Instant::now() < deadline {
+            if vs.ring.write_pos.load(Ordering::Acquire) >= want_frames {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let final_write = vs.ring.write_pos.load(Ordering::Acquire);
+        assert!(final_write >= want_frames,
+            "ring did not fill to {} within 3s (got {})", want_frames, final_write);
+
+        // Post-head ring samples must match reference.
+        for pos in head_end..want_frames {
+            let got = vs.get(pos);
+            let want = reference[pos];
+            assert_eq!(got, want,
+                "stream sample {} mismatch: got {} want {}", pos, got, want);
+            vs.ring.mark_consumed(pos);
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]

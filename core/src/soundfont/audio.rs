@@ -317,8 +317,22 @@ pub(super) fn load_audio_file_streamed(
     {
         return Ok(s);
     }
+    // Prefer the prebaked .x44c cache when present — head reads are
+    // sub-millisecond pread of raw i16. Falling back to direct FLAC
+    // here would re-decode every sample's head from scratch (1 s of
+    // audio per region) and burn minutes of CPU on libraries that
+    // were already prebaked on Mac.
     if let Some(s) =
         try_open_streamed_cache(path, stream_params.sample_rate, stream_params.channels)
+    {
+        return Ok(s);
+    }
+    // MOVE FORK / 2026-05-17 (day 2): direct FLAC streaming. For FLAC
+    // files at the target sample rate with no prebaked cache, open a
+    // per-voice symphonia decoder at register time and decode into
+    // the ring buffer on the I/O thread.
+    if let Some(s) =
+        try_open_flac_streamed(path, stream_params.sample_rate, stream_params.channels)
     {
         return Ok(s);
     }
@@ -507,6 +521,69 @@ fn try_open_wav_streamed(
         src_rate: sample_rate,
     });
     Some((source, sample_rate))
+}
+
+/// MOVE FORK / 2026-05-17 (day 2): open a FLAC file as a streamed source
+/// directly, no `.x44c` cache. Eligible iff the FLAC track's sample rate
+/// matches the target rate, channel count is mono or stereo, and we can
+/// determine n_frames up-front (symphonia parses the FLAC STREAMINFO
+/// block during probe — required for length-based loop bounds).
+///
+/// Each voice that plays this sample gets its own symphonia decoder
+/// (opened lazily on first refill in the I/O pool thread). The
+/// `StreamedSampleSource` only holds the path + metadata; no shared
+/// decoder state.
+///
+/// Non-matching FLACs (resample needed, > 2 channels, indeterminate
+/// length) return None and the caller falls back to the cache path.
+#[cfg(unix)]
+fn try_open_flac_streamed(
+    source: &PathBuf,
+    target_rate: u32,
+    target_chans: ChannelCount,
+) -> Option<StreamedSample> {
+    let ext = source.extension().and_then(|e| e.to_str()).map(str::to_lowercase);
+    if ext.as_deref() != Some("flac") {
+        return None;
+    }
+    let file = File::open(source).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let format = probed.format;
+    let track = format.default_track()?;
+    let sample_rate = track.codec_params.sample_rate?;
+    let channels = track.codec_params.channels?;
+    let n_frames = track.codec_params.n_frames? as usize;
+    let n_chans = channels.count();
+
+    if sample_rate != target_rate { return None; }
+    if n_chans == 0 || n_chans > 2 { return None; }
+    if n_frames == 0 { return None; }
+    let _ = target_chans;
+    // Drop the probe handle — each ring opens its own fresh decoder
+    // on the I/O thread to avoid sharing seek state.
+    drop(format);
+
+    let file_handle = File::open(source).ok()?;
+    let source_arc = Arc::new(StreamedSampleSource {
+        file: Arc::new(file_handle),
+        layout: super::streaming::SampleLayout::Flac {
+            path: source.clone(),
+        },
+        frames: n_frames,
+        n_chans,
+        src_rate: sample_rate,
+    });
+    Some((source_arc, sample_rate))
 }
 
 struct BuilderVecs {
