@@ -94,6 +94,7 @@ pub fn take_underrun_breakdown() -> (u32, u32, u32) {
     )
 }
 
+
 /// Always-resident head buffer length in frames. 1000 ms at 44.1 kHz.
 ///
 /// Sized to absorb the I/O thread's serial pread backlog under chord-
@@ -118,28 +119,42 @@ pub fn take_underrun_breakdown() -> (u32, u32, u32) {
 /// Future work if chord-bursts grow heavier (e.g. 16-note multi-layer):
 /// parallel I/O workers — 2 threads servicing the same registry halves
 /// the backlog. Day 4.
-pub const HEAD_FRAMES: usize = 44100;
+/// MOVE FORK / 2026-05-18: bumped 44100 (1 s) → 88200 (2 s) to cover
+/// release tails of layered presets (Spring Chimes Spring Pads = 6
+/// stacked layers; on note-off each spawns a release voice). With 2 s
+/// head, releases shorter than 2 s never touch the streaming ring,
+/// avoiding the IO pool starvation that caused frame drops on
+/// 4-note chord release with this preset. Voice spawn / note-on
+/// latency is UNCHANGED — head is already RAM-resident, voice still
+/// hands a pointer. Cost: ~176 KB per sample of head data (was 88 KB),
+/// preset load reads more bytes (~1 s longer for a 60-sample preset).
+pub const HEAD_FRAMES: usize = 88200;
 
-/// Per-voice ring buffer capacity in frames. 32768 = ~744 ms at 44.1 kHz.
+/// Per-voice ring buffer capacity in frames. 65536 = ~1.49 s at 44.1 kHz.
 /// Sized to give the I/O worker comfortable headroom between refills
 /// even under chord-burst conditions where the worker is also doing
 /// initial fills of freshly registered rings.
 ///
+/// MOVE FORK / 2026-05-18: bumped 32768 → 65536 to fix discontinuities
+/// on Electro Acoustic Piano (16 stacked mic groups → 24-50 concurrent
+/// voices) and Spring Chimes' Spring Pads (6 layers × 20s samples).
+/// At 32768 (744 ms ring), 3 workers couldn't keep up with chord+sustain
+/// → audible ring underruns. Per-voice RAM cost: 2 × 65536 × 2 bytes =
+/// 256 KB stereo. For 50 voices = ~13 MB extra. Move has the headroom.
+///
 /// MUST be a power of 2 — index wraparound uses `pos & (CAP - 1)`.
-pub const RING_FRAMES: usize = 32768;
+pub const RING_FRAMES: usize = 65536;
 const _: () = assert!(RING_FRAMES.is_power_of_two());
 
-/// Chunk size for each disk read (frames per channel). 16384 = ~372 ms.
+/// Chunk size for each disk read (frames per channel). 32768 = ~744 ms.
+/// Scales with RING_FRAMES (RING/2) so each refill fills half the ring.
 ///
-/// MOVE FORK / 2026-05-16: bumped 1024 → 8192 → 16384 over two
-/// iterations. Per-pread syscall + microSD controller overhead
-/// dominates small reads; larger chunks amortize the overhead. Per
-/// ring at 16384 frames per refill: one refill every ~372 ms of voice
-/// playback. Worker handling 14 rings does 14 refills per ~84 ms
-/// (~6 ms/pread under chord-burst contention), so per-ring fill rate
-/// is ~3.7× drain rate. Margin handles concurrent fresh-ring
-/// registrations + microSD GC tail latency without underrun.
-const REFILL_CHUNK_FRAMES: usize = 16384;
+/// MOVE FORK / 2026-05-16: bumped 1024 → 8192 → 16384.
+/// MOVE FORK / 2026-05-18: bumped 16384 → 32768 to track RING_FRAMES
+/// doubling. Same rationale — amortize per-pread syscall + microSD
+/// controller overhead over more frames; fewer worker round-trips per
+/// voice per second of playback.
+const REFILL_CHUNK_FRAMES: usize = 32768;
 
 /// Low-water mark: when `write_pos - consumed_hint` drops below this many
 /// frames, the I/O pool schedules a refill. Set to RING_FRAMES/2 so a
@@ -148,13 +163,26 @@ const REFILL_CHUNK_FRAMES: usize = 16384;
 const LOW_WATER_FRAMES: usize = RING_FRAMES / 2;
 
 /// Number of I/O worker threads in the pool. Each owns its own working
-/// set; new ring registrations are round-robin distributed. 3 workers
-/// give ~50% more aggregate refill throughput vs 2; needed to fully
-/// absorb chord-burst spawn bursts on multi-layer presets with sustain
-/// pedal held (Legacy Knight granular: ~28 sustained voices + 6-12
-/// fresh rings per noteon). Move has 4 CPU cores so 3 I/O threads +
-/// audio thread + xsynth rayon pool still leaves headroom.
-const N_IO_WORKERS: usize = 3;
+/// set; new ring registrations are round-robin distributed. Each worker
+/// is mostly sleeping on pread, so the cost of more workers is mainly
+/// scheduler overhead — small on Linux.
+///
+/// MOVE FORK / 2026-05-18: bumped 3 → 6. Three workers fully serialized
+/// refills for 16-group multi-mic presets like Electro Acoustic Piano
+/// where one chord spawns 30-50 voices. Each worker then juggled
+/// 10-16 rings and accumulated enough latency for ring underruns
+/// during chord + sustain. Six workers cut the per-worker queue
+/// roughly in half. Move has 4 CPU cores; IO workers spend nearly all
+/// their time blocked on pread so 6 sleeping threads add negligible
+/// scheduling load on top of the audio thread + xsynth rayon pool.
+// MOVE FORK / 2026-05-18: 6 → 1. Multiple IO workers running on the
+// audio core (core 3 on Move) polluted L1 cache and added scheduler
+// wake-ups that produced release-tail clicks on streaming voices. One
+// worker pinned to cores 0–2 (see pool_thread affinity) keeps refills
+// fast enough — no ring underruns under chord-burst — while removing
+// the cross-core contention entirely. Bigger libraries can revisit if
+// underruns appear; today's set has none.
+const N_IO_WORKERS: usize = 1;
 
 /// On-disk layout of sample data within the source file. Determines how
 /// the I/O pool reads bytes for a given (channel, frame) pair.
@@ -500,10 +528,31 @@ impl StreamRing {
     /// (the historical behavior). For regions with offset>0, the ring
     /// serves the file region just past the per-region head buffer.
     pub fn new_at(head_end_frame: usize) -> Self {
-        let data: Vec<UnsafeCell<i16>> =
-            (0..RING_FRAMES).map(|_| UnsafeCell::new(0)).collect();
+        // MOVE FORK / 2026-05-18: build the backing storage via a single
+        // zero-init Vec instead of a 65536-element Rust loop of
+        // `UnsafeCell::new(0)`. The previous form forced every byte to be
+        // written on the audio thread (~256 KB per stereo voice spawn,
+        // ~1.5 MB on a 3-voice chord-burst block) — cycles spent on
+        // calloc and page-commit that the audio thread can't afford.
+        //
+        // `vec![0i16; RING_FRAMES]` lowers to `alloc_zeroed`, which on
+        // Linux for >32 KiB allocations dispatches to `mmap` with
+        // `MAP_ANONYMOUS` — pages are zero-filled lazily by the kernel
+        // on first access (which always happens on the IO worker, not
+        // the audio thread). The audio-thread cost drops from ~10–30 µs
+        // per ring to one allocator call.
+        //
+        // SAFETY: `UnsafeCell<i16>` is `#[repr(transparent)]` over `i16`,
+        // so the two have identical layout, ABI, and validity. A
+        // zero-initialized `i16` is a valid `UnsafeCell<i16>`. The
+        // pointer cast preserves the slice length; ownership is moved
+        // through `Box::into_raw` / `Box::from_raw` in a single step.
+        let zero_i16: Box<[i16]> = vec![0i16; RING_FRAMES].into_boxed_slice();
+        let data: Box<[UnsafeCell<i16>]> = unsafe {
+            Box::from_raw(Box::into_raw(zero_i16) as *mut [UnsafeCell<i16>])
+        };
         StreamRing {
-            data: data.into_boxed_slice(),
+            data,
             write_pos: AtomicUsize::new(head_end_frame),
             consumed_hint: AtomicUsize::new(head_end_frame),
             eof: AtomicBool::new(false),
@@ -796,6 +845,24 @@ impl Drop for IoPool {
 }
 
 fn pool_thread(rx: Receiver<PoolCommand>) {
+    // MOVE FORK / 2026-05-18: pin this worker to cores 0–2 so it never
+    // lands on core 3, which Schwung reserves for the SCHED_FIFO 90 SPI
+    // audio callback (see schwung host's link-subscriber pinning). When
+    // the IO worker ran on core 3 it preempted the audio thread on
+    // refill wake-ups and polluted L1 — visible as Move-host
+    // "audio-dropouts:1" during streamed-voice release tails even with
+    // SFZ render well under budget. Failure here is non-fatal; the
+    // worker keeps running on its inherited affinity.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(0, &mut set);
+        libc::CPU_SET(1, &mut set);
+        libc::CPU_SET(2, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+
     let mut working_set: Vec<RegisteredRing> = Vec::with_capacity(64);
     // Per-pass scratch buffers, reused across refills:
     //  - sep_buf: u16-decoded scratch for Separated-layout reads
@@ -874,6 +941,12 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
                 continue;
             }
 
+            // MOVE FORK / 2026-05-18: time the actual disk read. Long
+            // reads (>20 ms) indicate SD bus contention — useful when
+            // diagnosing audible clicks correlated with concurrent disk
+            // activity (skipback, scan, x44c writes). Lazy file open
+            // costs are excluded.
+            let read_t0 = std::time::Instant::now();
             // Read `budget` frames of channel `r.channel` from the file
             // starting at frame `write_pos`. Layout determines the
             // byte-offset arithmetic and whether we stride.
@@ -930,6 +1003,26 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
                     unreachable!()
                 }
             };
+            let read_elapsed_ms = read_t0.elapsed().as_millis() as u64;
+            if read_elapsed_ms >= 5 {
+                use std::io::Write;
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()
+                    .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                {
+                    let layout_tag = match &r.source.layout {
+                        SampleLayout::Separated { .. }    => "x44c",
+                        SampleLayout::Interleaved { .. }  => "wav",
+                        SampleLayout::Flac { .. }         => "flac",
+                    };
+                    let _ = writeln!(f,
+                        "[xsynth] SLOW REFILL: {} ms layout={} ch={} write_pos={} budget={} ts={:.3}",
+                        read_elapsed_ms, layout_tag, r.channel, write_pos, budget, ts);
+                }
+            }
             match read_result {
                 Some((chunk, short)) => {
                     if !chunk.is_empty() {

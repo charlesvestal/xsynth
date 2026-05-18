@@ -331,6 +331,13 @@ pub(super) struct RrState {
 pub struct SampleSoundfont {
     instruments: Vec<SoundfontInstrument>,
     stream_params: AudioStreamParams,
+    /// MOVE FORK / 2026-05-18: max number of regions that overlap on
+    /// any single (key, vel) cell across the loaded soundfont. Used by
+    /// the C plugin to compute a per-preset polyphony cap that keeps
+    /// active voice counts within Move's audio-engine sustained-load
+    /// ceiling. A 16-mic-group preset like Electro Acoustic Piano lands
+    /// around 6-8 here; a 1-layer bass patch is 1.
+    max_region_stacking: u32,
     /// MOVE FORK / 2026-05-17: max absolute f32 amplitude across all
     /// per-region head buffers, factoring in each region's `volume`
     /// multiplier. Used by the C plugin to compute a per-preset
@@ -460,6 +467,63 @@ impl SampleSoundfont {
                 .collect()
         } else {
             regions
+        };
+
+        // MOVE FORK / 2026-05-18: compute worst-case simultaneous voice
+        // count per note-on across the (key, vel) plane.
+        //
+        // Round-robin semantics: regions with `seq_length > 1` share an
+        // RR cycle; per note-on, only the region whose `seq_position`
+        // matches the current cycle position fires. So at each cell we
+        // count "always-fire" regions plus the MAX count across RR
+        // groups (not the SUM). This matches what the DS converter
+        // emits for `<groups seqMode="round_robin">`: per-mic groups
+        // get the same seq_length with different seq_position values,
+        // so a 6-mic × 3-RR Electro Acoustic Piano lands at 6, not 18.
+        //
+        // Trigger filter: release-trigger regions only fire on NoteOff
+        // and don't contribute to attack-time voice count.
+        //
+        // Skip negative keyrange (CC-triggered regions, unsupported).
+        let max_region_stacking: u32 = {
+            use std::collections::HashMap;
+            let mut always_grid: Vec<u16> = vec![0u16; 128 * 128];
+            // Per RR cycle (keyed by seq_length): per-position grids.
+            let mut rr_grids: HashMap<u32, HashMap<u32, Vec<u16>>> = HashMap::new();
+            for r in &regions {
+                if r.trigger != xsynth_soundfonts::sfz::TriggerType::Attack {
+                    continue;
+                }
+                let klo = (*r.keyrange.start()).max(0) as usize;
+                let khi = (*r.keyrange.end()).max(0).min(127) as usize;
+                if klo > khi { continue; }
+                let vlo = (*r.velrange.start()).max(1) as usize;
+                let vhi = (*r.velrange.end()).min(127) as usize;
+                if vlo > vhi { continue; }
+                let grid: &mut Vec<u16> = if r.seq_length > 1 {
+                    let cycle = rr_grids.entry(r.seq_length).or_default();
+                    cycle.entry(r.seq_position)
+                         .or_insert_with(|| vec![0u16; 128 * 128])
+                } else {
+                    &mut always_grid
+                };
+                for k in klo..=khi {
+                    let row = k * 128;
+                    for v in vlo..=vhi {
+                        grid[row + v] = grid[row + v].saturating_add(1);
+                    }
+                }
+            }
+            let mut max_eff: u32 = 0;
+            for i in 0..(128 * 128) {
+                let mut eff: u32 = always_grid[i] as u32;
+                for cycle in rr_grids.values() {
+                    let rr_max: u16 = cycle.values().map(|g| g[i]).max().unwrap_or(0);
+                    eff += rr_max as u32;
+                }
+                if eff > max_eff { max_eff = eff; }
+            }
+            max_eff
         };
 
         // Find the unique samples that we need to parse and convert
@@ -961,7 +1025,28 @@ impl SampleSoundfont {
                             .unwrap_or(0),
                     };
                     let sample_peak_f32 = sample_peak_i16 as f32 / 32768.0;
-                    let voice_peak = sample_peak_f32 * sp.volume.abs();
+                    // MOVE FORK / 2026-05-17: include worst-case
+                    // volume_oncc contribution. DS-converted SFZ encodes
+                    // AMP_VOLUME knobs as `volume=-72` (silent baseline)
+                    // plus `volume_oncc<CC>=+80` (knob brings it back up
+                    // to ~unity, sometimes with author-set boost above
+                    // unity). The static `sp.volume` alone reads as
+                    // ~silent, so auto-gain saw "quiet preset" and never
+                    // attenuated — at runtime the knob added +80 dB,
+                    // peak shot past 0 dBFS, output clipped. Each oncc
+                    // entry's dB is the delta at CC=127; only positive
+                    // contributions matter for the peak ceiling.
+                    let max_oncc_db: f32 = sp
+                        .volume_oncc
+                        .iter()
+                        .map(|(_, db)| db.max(0.0))
+                        .sum();
+                    let oncc_linear = if max_oncc_db > 0.0 {
+                        10.0_f32.powf(max_oncc_db / 20.0)
+                    } else {
+                        1.0
+                    };
+                    let voice_peak = sample_peak_f32 * sp.volume.abs() * oncc_linear;
                     if voice_peak > max_peak {
                         max_peak = voice_peak;
                     }
@@ -982,6 +1067,7 @@ impl SampleSoundfont {
             }],
             stream_params,
             estimated_voice_peak,
+            max_region_stacking,
         })
     }
 
@@ -1174,6 +1260,9 @@ impl SampleSoundfont {
             // that disables auto-gain (1.0 = no attenuation, plugin
             // computes preset_attenuation = 1.0 below threshold).
             estimated_voice_peak: 0.5,
+            // SF2 isn't tuned for region-stacking. Report 1 so plugin
+            // falls back to its baseline polyphony default.
+            max_region_stacking: 1,
         })
     }
 
@@ -1183,6 +1272,14 @@ impl SampleSoundfont {
     /// SFZ libraries don't dominate user mixing.
     pub fn estimated_voice_peak(&self) -> f32 {
         self.estimated_voice_peak
+    }
+
+    /// MOVE FORK / 2026-05-18: max number of regions overlapping on any
+    /// single (key, vel) cell. Plugin uses this to size per-preset
+    /// polyphony so total active voices stay within the host's
+    /// sustained-load ceiling.
+    pub fn max_region_stacking(&self) -> u32 {
+        self.max_region_stacking
     }
 }
 

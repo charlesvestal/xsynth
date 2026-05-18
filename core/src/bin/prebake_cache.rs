@@ -24,6 +24,16 @@ use xsynth_core::{AudioStreamParams, ChannelCount};
 
 const TARGET_RATE: u32 = 44_100;
 
+/// Decoded samples are held in heap as i16 PCM (channels × frames × 2 B).
+/// A 30s, 48kHz/24-bit/stereo source decodes to ~5.5 MB; some piano libraries
+/// (Claustrophobic Piano V2, Hunter's Ampex) ship 90s+ samples that peak at
+/// ~750 MB per decode. Move only has 1.8 GB RAM total and the host audio
+/// engine sits at ~700 MB, so concurrent decodes OOM the device.
+///
+/// `PREBAKE_THREADS` env var controls the rayon pool size; default 1 is safe
+/// on Move. Set to `0` for "use all cores" (fine on Mac).
+const ENV_THREADS: &str = "PREBAKE_THREADS";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -49,10 +59,23 @@ fn main() {
         std::process::exit(0);
     }
 
+    let threads: usize = std::env::var(ENV_THREADS)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    if threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .ok();
+    }
+
     eprintln!(
-        "Pre-baking {} files into .x44c caches @ {} Hz stereo",
+        "Pre-baking {} files into .x44c caches @ {} Hz stereo ({} thread{})",
         files.len(),
-        TARGET_RATE
+        TARGET_RATE,
+        if threads == 0 { "all".into() } else { threads.to_string() },
+        if threads == 1 { "" } else { "s" }
     );
 
     let stream_params = AudioStreamParams::new(TARGET_RATE, ChannelCount::Stereo);

@@ -611,7 +611,13 @@ fn parse_sfz_opcode(
         "pitchlfo_freq"  => val.parse::<f32>().ok().map(PitchLfoFreq),
         "pitchlfo_depth" => val.parse::<f32>().ok().map(PitchLfoDepth),
         "offset" => parse_u32_in_range(val, 0..=u32::MAX).map(Offset),
-        "default_path" => Some(DefaultPath(val.replace('\\', "/"))),
+        // MOVE FORK / 2026-05-17: `prefix_sfz_path` is an alternate
+        // spelling some authors (jRhodes3d, others) use for the same
+        // semantic — prepend this string to every region's `sample=`
+        // path. Without it, jRhodes3d's outer .sfz files reference
+        // samples in a sibling subdir and we emit silence.
+        "default_path" | "prefix_sfz_path"
+            => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),
         "trigger" => parse_trigger(val).map(Trigger),
         "seq_length" | "seqlength" => parse_u32_in_range(val, 0..=255).map(SeqLength),

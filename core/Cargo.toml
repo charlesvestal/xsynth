@@ -30,6 +30,10 @@ proc-macro2 = "1.0.86"
 # MOVE FORK / Phase 9 evaluation: fundsp for delay/reverb/chorus/phaser.
 # MIT/Apache-2.0 — compatible with our LGPL-3.0 fork.
 fundsp = { version = "0.21", default-features = false }
+# MOVE FORK / 2026-05-18: needed for sched_setaffinity on the IO worker
+# thread (Linux only — cfg-gated at call site).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 serde = { version = "1.0", optional = true, features = ["derive"] }
 
 [features]
