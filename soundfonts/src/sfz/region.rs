@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{FilterType, LoopMode};
 
-use super::parse::{AriaOnccBase, SfzAmpegEnvelope, SfzGroupType, SfzOpcode, SfzToken};
+use super::parse::{AriaOnccBase, SfzAmpegEnvelope, SfzGroupType, SfzOpcode, SfzToken, XfCurve};
 
 /// MOVE FORK: SFZ `trigger=` opcode. Regions default to Attack (spawn
 /// on NoteOn). Release-trigger regions spawn on NoteOff instead and
@@ -161,6 +161,24 @@ pub(crate) struct RegionParamsBuilder {
     resonance_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
     pan_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / 2026-05-19: live `ampeg_*_oncc<N>=<value>` bindings.
+    /// Each entry is (cc, value_per_unit, cc_init_at_parse_normalized).
+    /// The runtime voice computes the *additional* contribution against
+    /// the parse-time fold:
+    ///     extra = value * (cc_now/127 - cc_init_at_parse)
+    /// then adds to the base ampeg_* params. cc_init is captured at parse
+    /// time so existing SGP-style libraries (set_hdcc72 + ampeg_release_oncc72)
+    /// produce zero extra at the initial CC value (the fold already included
+    /// that contribution) and respond linearly to subsequent CC changes.
+    ampeg_attack_oncc:  Vec<(u8, f32, f32)>,
+    ampeg_decay_oncc:   Vec<(u8, f32, f32)>,
+    ampeg_sustain_oncc: Vec<(u8, f32, f32)>,
+    ampeg_release_oncc: Vec<(u8, f32, f32)>,
+    /// MOVE FORK / 2026-05-19: live `tune_oncc<N>=<cents>` bindings —
+    /// each entry is (cc, cents_per_unit). Voice samples per-block (or
+    /// per-spawn) and adds Σ delta·cc/127 cents to the base pitch
+    /// ratio. Drives DS PITCH / GROUP_TUNING knob bindings.
+    tune_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: Phase 6 `_curvecc<N>=<curve_id>` bindings. Each entry
     /// (CC number, curve id) shapes the matching `_oncc<N>` modulation
     /// via curve[cc_value] ∈ [0, 1] instead of raw cc/127.
@@ -176,6 +194,16 @@ pub(crate) struct RegionParamsBuilder {
     sw_default: Option<i8>,
     sw_lokey: Option<i8>,
     sw_hikey: Option<i8>,
+    /// MOVE FORK / 2026-05-19: per-CC xfin/xfout crossfade ranges. Each
+    /// entry is (lo, hi) — xsynth has no live xfin/xfout sweep so these
+    /// resolve to a static amplitude factor at build time against the
+    /// parser's `set_cc` state, folded into `volume`. Pianobook Fake
+    /// Dulcimer (Tremolo) uses CC1 to pick which velocity-layer group
+    /// fires: layers outside the current CC value get factor=0 and are
+    /// dropped at build.
+    xfin_cc:  HashMap<u8, (u8, u8)>,
+    xfout_cc: HashMap<u8, (u8, u8)>,
+    xf_cccurve: XfCurve,
 }
 
 impl Default for RegionParamsBuilder {
@@ -237,6 +265,11 @@ impl Default for RegionParamsBuilder {
             cc_ranges: HashMap::new(),
             volume_oncc: Vec::new(),
             cutoff_oncc: Vec::new(),
+            ampeg_attack_oncc:  Vec::new(),
+            ampeg_decay_oncc:   Vec::new(),
+            ampeg_sustain_oncc: Vec::new(),
+            ampeg_release_oncc: Vec::new(),
+            tune_oncc: Vec::new(),
             resonance_oncc: Vec::new(),
             pan_oncc: Vec::new(),
             volume_curvecc: Vec::new(),
@@ -247,6 +280,9 @@ impl Default for RegionParamsBuilder {
             sw_default: None,
             sw_lokey: None,
             sw_hikey: None,
+            xfin_cc:  HashMap::new(),
+            xfout_cc: HashMap::new(),
+            xf_cccurve: XfCurve::Gain,
         }
     }
 }
@@ -400,6 +436,14 @@ impl RegionParamsBuilder {
                     self.pan_oncc.push((cc, pct));
                 }
             }
+            // MOVE FORK / 2026-05-19: collect tune_oncc bindings on this region.
+            SfzOpcode::TuneOncc(cc, cents) => {
+                if let Some(existing) = self.tune_oncc.iter_mut().find(|(c, _)| *c == cc) {
+                    existing.1 = cents;
+                } else {
+                    self.tune_oncc.push((cc, cents));
+                }
+            }
             // MOVE FORK: Phase 6 curvecc — attach curve_id to the binding
             // for the matching CC. Last-assignment-wins like _oncc.
             SfzOpcode::VolumeCurvecc(cc, id) => {
@@ -447,6 +491,26 @@ impl RegionParamsBuilder {
             SfzOpcode::SwDefault(val) => self.sw_default = Some(val),
             SfzOpcode::SwLokey(val)   => self.sw_lokey   = Some(val),
             SfzOpcode::SwHikey(val)   => self.sw_hikey   = Some(val),
+            // MOVE FORK / 2026-05-19: CC-based crossfade ranges. Same
+            // accumulation pattern as cc_ranges (LoCc/HiCc): each opcode
+            // sets one side of the (lo, hi) pair for the given CC.
+            SfzOpcode::XfInLoCc(n, v) => {
+                let e = self.xfin_cc.entry(n).or_insert((0, 0));
+                e.0 = v;
+            }
+            SfzOpcode::XfInHiCc(n, v) => {
+                let e = self.xfin_cc.entry(n).or_insert((0, 0));
+                e.1 = v;
+            }
+            SfzOpcode::XfOutLoCc(n, v) => {
+                let e = self.xfout_cc.entry(n).or_insert((0, 0));
+                e.0 = v;
+            }
+            SfzOpcode::XfOutHiCc(n, v) => {
+                let e = self.xfout_cc.entry(n).or_insert((0, 0));
+                e.1 = v;
+            }
+            SfzOpcode::XfCcCurve(c) => self.xf_cccurve = c,
         }
     }
 
@@ -473,6 +537,41 @@ impl RegionParamsBuilder {
             }
         }
 
+        // MOVE FORK / 2026-05-19: static evaluation of xfin/xfout CC
+        // crossfades. xsynth has no live xfin/xfout sweep, so each
+        // configured (lo, hi) pair collapses to one amplitude factor
+        // against the parser's set_cc state. Combined factor across all
+        // CCs is folded into the region's volume as dB attenuation;
+        // regions whose factor is effectively zero are dropped so we
+        // don't pay sample I/O for silent layers. Drives the
+        // velocity-layer pattern in Pianobook's Fake Dulcimer (Tremolo)
+        // SFZ where set_cc1=5 picks one of four velocity-layer groups.
+        let curve = self.xf_cccurve;
+        let mut volume_factor: f32 = 1.0;
+        for (&cc_n, &(lo, hi)) in self.xfin_cc.iter() {
+            let cc_v = cc_state.get(&cc_n).copied().unwrap_or(0.0);
+            let cc_int = (cc_v * 127.0).round().clamp(0.0, 127.0) as u8;
+            volume_factor *= xfin_factor(cc_int, lo, hi, curve);
+        }
+        for (&cc_n, &(lo, hi)) in self.xfout_cc.iter() {
+            let cc_v = cc_state.get(&cc_n).copied().unwrap_or(0.0);
+            let cc_int = (cc_v * 127.0).round().clamp(0.0, 127.0) as u8;
+            volume_factor *= xfout_factor(cc_int, lo, hi, curve);
+        }
+        // -80 dB threshold: any quieter and the voice is effectively
+        // inaudible — drop the region entirely to save sample I/O.
+        if volume_factor <= 1.0e-4 {
+            return None;
+        }
+        // Fold into volume only when there's meaningful attenuation
+        // (avoid integer-round noise when factor ≈ 1.0).
+        let folded_volume = if (1.0 - volume_factor).abs() > 1.0e-3 {
+            let db_attn = 20.0 * volume_factor.log10();
+            ((self.volume as f32 + db_attn).round().clamp(-144.0, 6.0)) as i16
+        } else {
+            self.volume
+        };
+
         let relative_sample_path = if let Some(default_path) = self.default_path {
             PathBuf::from(default_path).join(self.sample?)
         } else {
@@ -489,7 +588,7 @@ impl RegionParamsBuilder {
             velrange: self.lovel..=self.hivel,
             keyrange: self.lokey..=self.hikey,
             pitch_keycenter: self.pitch_keycenter,
-            volume: self.volume,
+            volume: folded_volume,
             pan: self.pan,
             sample_path,
             loop_mode: self.loop_mode,
@@ -540,6 +639,11 @@ impl RegionParamsBuilder {
             cutoff_oncc: self.cutoff_oncc,
             resonance_oncc: self.resonance_oncc,
             pan_oncc: self.pan_oncc,
+            ampeg_attack_oncc:  self.ampeg_attack_oncc,
+            ampeg_decay_oncc:   self.ampeg_decay_oncc,
+            ampeg_sustain_oncc: self.ampeg_sustain_oncc,
+            ampeg_release_oncc: self.ampeg_release_oncc,
+            tune_oncc: self.tune_oncc,
             volume_curvecc: self.volume_curvecc,
             cutoff_curvecc: self.cutoff_curvecc,
             resonance_curvecc: self.resonance_curvecc,
@@ -637,6 +741,20 @@ pub struct RegionParams {
     pub resonance_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: live `pan_oncc<N>=<percent>` bindings on this region.
     pub pan_oncc: Vec<(u8, f32)>,
+    /// MOVE FORK / 2026-05-19: live `ampeg_*_oncc<N>=<value>` bindings.
+    /// Each entry is (cc, value_per_unit, cc_init_at_parse_normalized).
+    /// Voice computes the runtime contribution as
+    ///     extra = value * (cc_now/127 - cc_init_at_parse)
+    /// and adds it to the base ampeg_* param at note-on (attack/decay/
+    /// sustain snapshot) and note-off (release recompute).
+    pub ampeg_attack_oncc:  Vec<(u8, f32, f32)>,
+    pub ampeg_decay_oncc:   Vec<(u8, f32, f32)>,
+    pub ampeg_sustain_oncc: Vec<(u8, f32, f32)>,
+    pub ampeg_release_oncc: Vec<(u8, f32, f32)>,
+    /// MOVE FORK / 2026-05-19: live `tune_oncc<N>=<cents>` bindings.
+    /// (cc, cents_per_unit). Voice adds Σ delta·cc/127 cents to base
+    /// pitch — drives DS PITCH/GROUP_TUNING knob bindings.
+    pub tune_oncc: Vec<(u8, f32)>,
     /// MOVE FORK: Phase 6 curvecc bindings — each entry (CC, curve_id)
     /// tells the matching SIMD generator to look up curve[cc_value]
     /// from `curves` instead of using cc_value/127 directly.
@@ -657,6 +775,45 @@ pub struct RegionParams {
     pub sw_default: Option<i8>,
     pub sw_lokey: Option<i8>,
     pub sw_hikey: Option<i8>,
+}
+
+/// MOVE FORK / 2026-05-19: xfin amplitude factor at CC value `cc` for a
+/// (lo, hi) fade-in range. Below lo → 0 (silent), above hi → 1 (full),
+/// linear in amplitude between (gain curve) or sin(pi/2 * frac) for
+/// equal-power (power curve). Degenerate range (hi <= lo) collapses to a
+/// binary step at lo.
+fn xfin_factor(cc: u8, lo: u8, hi: u8, curve: XfCurve) -> f32 {
+    if hi <= lo {
+        // SFZ convention: an unconfigured range (still at (0, 0)) means
+        // "fade-in inactive, full volume". A configured but inverted /
+        // degenerate range falls back to a binary step at `lo`.
+        if lo == 0 && hi == 0 { return 1.0; }
+        return if cc >= lo { 1.0 } else { 0.0 };
+    }
+    if cc <= lo { return 0.0; }
+    if cc >= hi { return 1.0; }
+    let frac = (cc - lo) as f32 / (hi - lo) as f32;
+    match curve {
+        XfCurve::Gain  => frac,
+        XfCurve::Power => (frac * std::f32::consts::FRAC_PI_2).sin(),
+    }
+}
+
+/// MOVE FORK / 2026-05-19: xfout amplitude factor — mirror of xfin.
+/// Below lo → 1 (still full), above hi → 0 (silent), interpolating
+/// between. Degenerate range collapses to a binary step at lo.
+fn xfout_factor(cc: u8, lo: u8, hi: u8, curve: XfCurve) -> f32 {
+    if hi <= lo {
+        if lo == 0 && hi == 0 { return 1.0; }
+        return if cc > lo { 0.0 } else { 1.0 };
+    }
+    if cc <= lo { return 1.0; }
+    if cc >= hi { return 0.0; }
+    let frac = (hi - cc) as f32 / (hi - lo) as f32;
+    match curve {
+        XfCurve::Gain  => frac,
+        XfCurve::Power => (frac * std::f32::consts::FRAC_PI_2).sin(),
+    }
 }
 
 fn get_group_level(group_type: SfzGroupType) -> Option<usize> {
@@ -767,6 +924,11 @@ pub(super) fn parse_sf_root(
                 if current_group.is_some() && current_group != Some(SfzGroupType::Curve) {
                     if let Some(group_data) = group_data_stack.back_mut() {
                         let env = &mut group_data.ampeg_envelope;
+                        // (1) Fold into base ampeg_* so libraries that rely on
+                        // a single static set_hdcc<N>=v (Splendid Grand Piano)
+                        // still produce the right initial envelope. The runtime
+                        // contribution below subtracts cc_init back out, so the
+                        // base + extra at CC==init equals the folded value.
                         match base {
                             AriaOnccBase::AmpegAttack => env.ampeg_attack += contribution,
                             AriaOnccBase::AmpegHold => env.ampeg_hold += contribution,
@@ -775,6 +937,29 @@ pub(super) fn parse_sf_root(
                             AriaOnccBase::AmpegRelease => env.ampeg_release += contribution,
                             AriaOnccBase::AmpegDelay => env.ampeg_delay += contribution,
                             AriaOnccBase::AmpegStart => env.ampeg_start += contribution,
+                        }
+                        // (2) MOVE FORK / 2026-05-19: also record the binding
+                        // for the runtime voice. cc_v is the normalized init
+                        // value used in the fold; runtime evaluates
+                        //     extra = value * (cc_now/127 - cc_v)
+                        // and adds to the base ampeg_* param at envelope
+                        // stage transitions (note-on for atk/dec/sus, note-off
+                        // for release). attack/decay/sustain/release only;
+                        // hold/delay/start aren't exposed as live knobs.
+                        let entry = (cc, value, cc_v);
+                        fn upsert(v: &mut Vec<(u8, f32, f32)>, e: (u8, f32, f32)) {
+                            if let Some(x) = v.iter_mut().find(|x| x.0 == e.0) {
+                                *x = e;
+                            } else {
+                                v.push(e);
+                            }
+                        }
+                        match base {
+                            AriaOnccBase::AmpegAttack  => upsert(&mut group_data.ampeg_attack_oncc,  entry),
+                            AriaOnccBase::AmpegDecay   => upsert(&mut group_data.ampeg_decay_oncc,   entry),
+                            AriaOnccBase::AmpegSustain => upsert(&mut group_data.ampeg_sustain_oncc, entry),
+                            AriaOnccBase::AmpegRelease => upsert(&mut group_data.ampeg_release_oncc, entry),
+                            _ => {}
                         }
                     }
                 }

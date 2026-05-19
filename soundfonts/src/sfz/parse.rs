@@ -161,12 +161,42 @@ pub enum SfzOpcode {
     CutoffCurvecc(u8, u8),
     ResonanceCurvecc(u8, u8),
     PanCurvecc(u8, u8),
+    /// MOVE FORK / 2026-05-19: `tune_oncc<N>=<cents>` — live pitch
+    /// modulation. cents is the value added at CC=full-scale; runtime
+    /// scales linearly by cc/127. Drives DS PITCH / GROUP_TUNING knobs.
+    TuneOncc(u8, f32),
     /// MOVE FORK: `index=<id>` inside a `<curve>` block. Identifies the
     /// curve table being defined.
     CurveIndex(u8),
     /// MOVE FORK: `v<NNN>=<f32>` inside a `<curve>` block. NNN is
     /// 0..127. Defines one sample point of the current curve.
     CurvePoint(u8, f32),
+    /// MOVE FORK / 2026-05-19: CC-based amplitude crossfade — `xfin_locc<N>`
+    /// (region silent below this CC value, ramping up by hi), `xfin_hicc<N>`
+    /// (region full above this CC value), and matching `xfout_*` for the
+    /// fade-out side. Each (lo, hi) pair defines a linear (or equal-power
+    /// with `xf_cccurve=power`) amplitude scale evaluated STATICALLY at
+    /// region build time against the parser's `set_cc` state. xsynth has
+    /// no live xfin/xfout sweep yet — regions whose static factor is
+    /// effectively zero are dropped; otherwise the factor is folded into
+    /// `volume=` as dB attenuation. Drives velocity-layer SFZ libraries
+    /// like Pianobook Fake Dulcimer (Tremolo) where CC1 picks which
+    /// velocity-layer group fires.
+    XfInLoCc(u8, u8),
+    XfInHiCc(u8, u8),
+    XfOutLoCc(u8, u8),
+    XfOutHiCc(u8, u8),
+    /// MOVE FORK / 2026-05-19: `xf_cccurve` — "gain" (linear-amp, default)
+    /// or "power" (equal-power, sin/cos curve). Applied to xfin/xfout
+    /// CC-based crossfades at build time.
+    XfCcCurve(XfCurve),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XfCurve {
+    #[default]
+    Gain,
+    Power,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -403,6 +433,44 @@ fn parse_sfz_opcode(
         return Ok(None);
     }
 
+    // MOVE FORK / 2026-05-19: xfin_locc<N> / xfin_hicc<N> / xfout_locc<N>
+    // / xfout_hicc<N> — CC-based amplitude crossfade. Match BEFORE the
+    // generic `locc`/`hicc` prefixes since those would otherwise eat the
+    // "xfin_locc..." suffix. Velocity variants (xfin_lovel/etc.) are not
+    // parsed here yet — they need per-voice (not per-region) application.
+    if let Some(rest) = name.strip_prefix("xfin_locc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(XfInLoCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(rest) = name.strip_prefix("xfin_hicc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(XfInHiCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(rest) = name.strip_prefix("xfout_locc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(XfOutLoCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(rest) = name.strip_prefix("xfout_hicc") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if let Ok(v) = val.parse::<u8>() {
+                return Ok(Some(XfOutHiCc(n, v.min(127))));
+            }
+        }
+        return Ok(None);
+    }
+
     // MOVE FORK: locc<N>=v / hicc<N>=v — static CC-range gating for
     // regions/groups. Parsed here, resolved against the parser's
     // cc_state at region build time.
@@ -457,6 +525,15 @@ fn parse_sfz_opcode(
             if base_name == "pan" {
                 if let Ok(v) = val.parse::<f32>() {
                     return Ok(Some(PanOncc(cc_n, v)));
+                }
+                return Ok(None);
+            }
+            // MOVE FORK / 2026-05-19: live tune_oncc<N>=<cents>. Drives
+            // DS PITCH / GROUP_TUNING knob bindings — value is cents
+            // added at full-CC (CC=127 contributes the full value).
+            if base_name == "tune" {
+                if let Ok(v) = val.parse::<f32>() {
+                    return Ok(Some(TuneOncc(cc_n, v)));
                 }
                 return Ok(None);
             }
@@ -622,6 +699,13 @@ fn parse_sfz_opcode(
         "trigger" => parse_trigger(val).map(Trigger),
         "seq_length" | "seqlength" => parse_u32_in_range(val, 0..=255).map(SeqLength),
         "seq_position" | "seqposition" => parse_u32_in_range(val, 0..=255).map(SeqPosition),
+        // MOVE FORK / 2026-05-19: xf_cccurve = gain | power. Defaults to
+        // gain (linear-amp). Power = equal-power sin/cos curve.
+        "xf_cccurve" => match val {
+            "gain"  => Some(XfCcCurve(XfCurve::Gain)),
+            "power" => Some(XfCcCurve(XfCurve::Power)),
+            _ => None,
+        },
 
         "ampeg_delay" => parse_float_in_range(val, 0.0..=100.0)
             .map(AmpegDelay)
