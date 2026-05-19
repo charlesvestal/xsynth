@@ -156,6 +156,23 @@ struct SampleVoiceSpawnerParams {
     filter_type: FilterType,
     loop_params: LoopParams,
     envelope: Arc<EnvelopeParameters>,
+    /// MOVE FORK / 2026-05-19: source EnvelopeDescriptor that produced
+    /// `envelope` above. Kept around so voice spawn can rebuild a
+    /// CC-modulated EnvelopeParameters from base + per-region ampeg_*_oncc
+    /// using live `cc_state` values, instead of the static fold the parser
+    /// did at preset-load time.
+    envelope_descriptor: EnvelopeDescriptor,
+    envelope_options: EnvelopeOptions,
+    /// MOVE FORK / 2026-05-19: per-region `ampeg_*_oncc` deltas. Each
+    /// entry is `(cc, value_per_unit, cc_init_at_parse_normalized)`.
+    /// At voice spawn the voice computes
+    ///     effective_param = base + Σ value * (cc_state[cc]/127 - cc_init)
+    /// so DS knob bindings to `ENV_*` (or SFZ `ampeg_*_oncc` opcodes)
+    /// become live without re-loading the soundfont.
+    ampeg_attack_oncc:  Arc<[(u8, f32, f32)]>,
+    ampeg_decay_oncc:   Arc<[(u8, f32, f32)]>,
+    ampeg_sustain_oncc: Arc<[(u8, f32, f32)]>,
+    ampeg_release_oncc: Arc<[(u8, f32, f32)]>,
     sample: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
@@ -338,6 +355,11 @@ pub struct SampleSoundfont {
     /// ceiling. A 16-mic-group preset like Electro Acoustic Piano lands
     /// around 6-8 here; a 1-layer bass patch is 1.
     max_region_stacking: u32,
+    /// MOVE FORK / 2026-05-19: minimum SFZ `polyphony=N` opcode value
+    /// across all loaded regions. None when no region declared one —
+    /// the plugin's auto-heuristic applies. Some(N) means the author
+    /// explicitly capped voices and we honor it as authoritative.
+    declared_polyphony: Option<u32>,
     /// MOVE FORK / 2026-05-17: max absolute f32 amplitude across all
     /// per-region head buffers, factoring in each region's `volume`
     /// multiplier. Used by the C plugin to compute a per-preset
@@ -525,6 +547,15 @@ impl SampleSoundfont {
             }
             max_eff
         };
+
+        // MOVE FORK / 2026-05-19: collect the SFZ-declared `polyphony=`
+        // opcode across regions. Take the minimum so author intent
+        // ("polyphony=1" anywhere in the file = monophonic) wins. None
+        // when no region declared one.
+        let declared_polyphony: Option<u32> = regions
+            .iter()
+            .filter_map(|r| r.polyphony)
+            .min();
 
         // Find the unique samples that we need to parse and convert
         let unique_sample_params: HashSet<_> = regions
@@ -797,8 +828,13 @@ impl SampleSoundfont {
                     let mut envelope = region.ampeg_envelope.clone();
                     envelope.ampeg_release +=
                         (vel as f32 / 127.0) * region.ampeg_envelope.ampeg_vel2release;
+                    // MOVE FORK / 2026-05-19: capture the EnvelopeDescriptor
+                    // so voice spawn can rebuild EnvelopeParameters from
+                    // base + cc_state + ampeg_*_oncc each note-on.
+                    let envelope_descriptor =
+                        envelope_descriptor_from_region_params(&envelope);
                     let envelope_params = Arc::new(
-                        envelope_descriptor_from_region_params(&envelope).to_envelope_params(
+                        envelope_descriptor.to_envelope_params(
                             stream_params.sample_rate,
                             options.vol_envelope_options,
                         ),
@@ -916,6 +952,12 @@ impl SampleSoundfont {
                         pan,
                         volume,
                         envelope: envelope_params,
+                        envelope_descriptor,
+                        envelope_options: options.vol_envelope_options,
+                        ampeg_attack_oncc:  Arc::from(region.ampeg_attack_oncc.as_slice()),
+                        ampeg_decay_oncc:   Arc::from(region.ampeg_decay_oncc.as_slice()),
+                        ampeg_sustain_oncc: Arc::from(region.ampeg_sustain_oncc.as_slice()),
+                        ampeg_release_oncc: Arc::from(region.ampeg_release_oncc.as_slice()),
                         speed_mult,
                         cutoff,
                         resonance: db_to_amp(region.resonance) * Q_BUTTERWORTH_F32,
@@ -924,7 +966,13 @@ impl SampleSoundfont {
                         interpolator: options.interpolator,
                         loop_params,
                         sample: region_samples,
-                        exclusive_class: None,
+                        // MOVE FORK / 2026-05-19: SFZ chokes via region's
+                        // group/off_by parse-time mapping (see
+                        // RegionParamsBuilder::build). xsynth-core's voice
+                        // spawn already kills voices sharing exclusive_class
+                        // — the SFZ path now feeds that mechanism instead
+                        // of leaving it None.
+                        exclusive_class: region.exclusive_class,
                         seq_position: region.seq_position.min(u8::MAX as u32) as u8,
                         volume_oncc: volume_oncc.clone(),
                         cutoff_oncc: cutoff_oncc.clone(),
@@ -1068,6 +1116,7 @@ impl SampleSoundfont {
             stream_params,
             estimated_voice_peak,
             max_region_stacking,
+            declared_polyphony,
         })
     }
 
@@ -1188,6 +1237,16 @@ impl SampleSoundfont {
                             pan,
                             volume: note_params.volume,
                             envelope: envelope_params,
+                            envelope_descriptor: envelope,
+                            envelope_options: options.vol_envelope_options,
+                            // SF2 doesn't carry SFZ-style ampeg_*_oncc lists
+                            // (it has its own CC paths). Empty Arcs are
+                            // cheap — voice spawn short-circuits when all
+                            // four lists are empty.
+                            ampeg_attack_oncc:  Arc::from(Vec::<(u8, f32, f32)>::new().into_boxed_slice()),
+                            ampeg_decay_oncc:   Arc::from(Vec::<(u8, f32, f32)>::new().into_boxed_slice()),
+                            ampeg_sustain_oncc: Arc::from(Vec::<(u8, f32, f32)>::new().into_boxed_slice()),
+                            ampeg_release_oncc: Arc::from(Vec::<(u8, f32, f32)>::new().into_boxed_slice()),
                             speed_mult,
                             cutoff,
                             resonance: db_to_amp(note_params.resonance) * Q_BUTTERWORTH_F32,
@@ -1263,6 +1322,7 @@ impl SampleSoundfont {
             // SF2 isn't tuned for region-stacking. Report 1 so plugin
             // falls back to its baseline polyphony default.
             max_region_stacking: 1,
+            declared_polyphony: None,
         })
     }
 
@@ -1280,6 +1340,14 @@ impl SampleSoundfont {
     /// sustained-load ceiling.
     pub fn max_region_stacking(&self) -> u32 {
         self.max_region_stacking
+    }
+
+    /// MOVE FORK / 2026-05-19: SFZ-declared minimum `polyphony=N` value
+    /// across all regions, or 0 when no region declared one. Plugin
+    /// uses this to honor monophonic SFZ files etc. — author intent
+    /// overrides the auto-heuristic.
+    pub fn declared_polyphony(&self) -> u32 {
+        self.declared_polyphony.unwrap_or(0)
     }
 }
 

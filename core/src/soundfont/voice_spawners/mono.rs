@@ -36,6 +36,15 @@ pub struct MonoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     loop_params: LoopParams,
     amp: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
+    /// MOVE FORK / 2026-05-19: live ampeg recompute path — see stereo.rs
+    /// for the full explanation. Mono spawners get the same plumbing
+    /// so SFZ files that author ampeg_*_oncc on a mono region work too.
+    envelope_descriptor: crate::voice::EnvelopeDescriptor,
+    envelope_options: crate::soundfont::EnvelopeOptions,
+    ampeg_attack_oncc:  Arc<[(u8, f32, f32)]>,
+    ampeg_decay_oncc:   Arc<[(u8, f32, f32)]>,
+    ampeg_sustain_oncc: Arc<[(u8, f32, f32)]>,
+    ampeg_release_oncc: Arc<[(u8, f32, f32)]>,
     sample_source: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
@@ -87,6 +96,12 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             loop_params: params.loop_params.clone(),
             amp,
             volume_envelope_params: params.envelope.clone(),
+            envelope_descriptor: params.envelope_descriptor,
+            envelope_options: params.envelope_options,
+            ampeg_attack_oncc:  params.ampeg_attack_oncc.clone(),
+            ampeg_decay_oncc:   params.ampeg_decay_oncc.clone(),
+            ampeg_sustain_oncc: params.ampeg_sustain_oncc.clone(),
+            ampeg_release_oncc: params.ampeg_release_oncc.clone(),
             sample_source: params.sample.clone(),
             interpolator: params.interpolator,
             exclusive_class: params.exclusive_class,
@@ -200,14 +215,44 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         &self,
         gen: Gen,
         control: &VoiceControlData,
+        cc_state: &CcState,
     ) -> impl SIMDVoiceGenerator<S, Sample>
     where
         Sample: SIMDSample<S>,
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
+        let has_oncc = !self.ampeg_attack_oncc.is_empty()
+            || !self.ampeg_decay_oncc.is_empty()
+            || !self.ampeg_sustain_oncc.is_empty()
+            || !self.ampeg_release_oncc.is_empty();
+        let base_params = if has_oncc {
+            let mut desc = self.envelope_descriptor;
+            let extra = |list: &[(u8, f32, f32)]| -> f32 {
+                let mut acc = 0.0_f32;
+                for &(cc, value, cc_init) in list.iter() {
+                    let cc_norm = cc_state[cc as usize]
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        as f32
+                        / 127.0;
+                    acc += value * (cc_norm - cc_init);
+                }
+                acc
+            };
+            desc.attack          = (desc.attack          + extra(&self.ampeg_attack_oncc)).max(0.0);
+            desc.decay           = (desc.decay           + extra(&self.ampeg_decay_oncc)).max(0.0);
+            desc.sustain_percent = (desc.sustain_percent + extra(&self.ampeg_sustain_oncc)).clamp(0.0, 1.0);
+            desc.release         = (desc.release         + extra(&self.ampeg_release_oncc)).max(0.0);
+            desc.to_envelope_params(
+                self.stream_params.sample_rate,
+                self.envelope_options,
+            )
+        } else {
+            *self.volume_envelope_params.clone()
+        };
+
         let modified_params = SIMDVoiceEnvelope::<S>::get_modified_envelope(
-            *self.volume_envelope_params.clone(),
+            base_params,
             control.envelope,
             self.stream_params.sample_rate as f32,
         );
@@ -215,7 +260,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         let allow_release = self.loop_params.mode != LoopMode::OneShot;
 
         let volume_envelope = SIMDVoiceEnvelope::new(
-            *self.volume_envelope_params.clone(),
+            base_params,
             modified_params,
             allow_release,
             self.stream_params.sample_rate as f32,
@@ -247,7 +292,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
         let gen = self.apply_velocity(gen);
         let gen = self.apply_volume_oncc(gen, cc_state);
         let gen = self.apply_amp_lfo(gen, cc_state);
-        let gen = self.apply_envelope(gen, control);
+        let gen = self.apply_envelope(gen, control, cc_state);
 
         self.apply_cutoff_effect(gen, cc_state)
     }

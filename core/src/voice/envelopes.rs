@@ -392,7 +392,12 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
         if let Some(release) = envelope.release {
             let old_duration =
                 params.get_stage_duration(EnvelopeStage::Release) as f32 / sample_rate;
-            let duration = (calculate_curve(release, old_duration).max(0.02) * sample_rate) as u32;
+            // MOVE FORK / 2026-05-19: 20 ms floor was too long — users
+            // turning Rel +/- to -50 expect "no release" but heard a
+            // 20 ms tail. 1 ms is short enough to feel instant while
+            // still ramping smoothly enough to avoid the abrupt-cut
+            // click that drove the original floor.
+            let duration = (calculate_curve(release, old_duration).max(0.001) * sample_rate) as u32;
 
             let part = EnvelopeStage::Release.as_usize();
             match params.parts[part] {
@@ -405,6 +410,53 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
                     duration: _,
                 } => params.modify_stage_data(part, EnvelopePart::lerp_concave(target, duration)),
                 _ => {}
+            }
+        }
+        // MOVE FORK / 2026-05-19: same curve mapping for decay duration.
+        if let Some(decay) = envelope.decay {
+            let old_duration =
+                params.get_stage_duration(EnvelopeStage::Decay) as f32 / sample_rate;
+            let duration = (calculate_curve(decay, old_duration) * sample_rate) as u32;
+
+            let part = EnvelopeStage::Decay.as_usize();
+            match params.parts[part] {
+                EnvelopePart::Lerp {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp(target, duration)),
+                EnvelopePart::LerpConcave {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp_concave(target, duration)),
+                _ => {}
+            }
+        }
+        // MOVE FORK / 2026-05-19: sustain-level multiplier. 0..=64 scales
+        // sustain target down to silence, 65..=128 raises toward unity.
+        // The decay stage's `target` is the sustain_percent — we update
+        // both the decay end-target AND the sustain hold so the held
+        // amplitude follows the knob without a discontinuity.
+        if let Some(sustain) = envelope.sustain {
+            let mult = if sustain <= 64 {
+                sustain as f32 / 64.0
+            } else {
+                1.0 + (sustain as f32 - 64.0) / 63.0 * 0.5  // up to 1.5×
+            };
+            let decay_part = EnvelopeStage::Decay.as_usize();
+            match params.parts[decay_part] {
+                EnvelopePart::Lerp { target, duration } => params.modify_stage_data(
+                    decay_part,
+                    EnvelopePart::lerp((target * mult).clamp(0.0, 1.0), duration),
+                ),
+                EnvelopePart::LerpConcave { target, duration } => params.modify_stage_data(
+                    decay_part,
+                    EnvelopePart::lerp_concave((target * mult).clamp(0.0, 1.0), duration),
+                ),
+                _ => {}
+            }
+            let sustain_part = EnvelopeStage::Sustain.as_usize();
+            if let EnvelopePart::Hold(v) = params.parts[sustain_part] {
+                params.modify_stage_data(sustain_part, EnvelopePart::hold((v * mult).clamp(0.0, 1.0)));
             }
         }
 

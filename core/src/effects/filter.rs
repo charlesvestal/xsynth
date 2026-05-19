@@ -66,6 +66,10 @@ impl BiQuadFilter {
                 Coefficients::<f32>::from_params(Type::BandPass, sample_rate.hz(), freq.hz(), q)
                     .unwrap()
             }
+            FilterType::Notch => {
+                Coefficients::<f32>::from_params(Type::Notch, sample_rate.hz(), freq.hz(), q)
+                    .unwrap()
+            }
         }
     }
 

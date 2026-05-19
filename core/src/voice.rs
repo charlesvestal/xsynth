@@ -68,6 +68,20 @@ pub struct EnvelopeControlData {
     /// Controls the release. Can take values from 0 to 128
     /// according to the MIDI CC spec.
     pub release: Option<u8>,
+
+    /// MOVE FORK / 2026-05-19: live decay-time modifier. Same 0..128
+    /// scale as attack/release — 64 = unity (no change), <64 scales
+    /// duration down, >64 adds up to 15 s to base. Mirrors CC73/CC72
+    /// semantics so a single envelope-control curve covers all four
+    /// ADSR knobs.
+    pub decay: Option<u8>,
+
+    /// MOVE FORK / 2026-05-19: live sustain-level modifier. 0 forces
+    /// the sustain target to silence; 64 = unity; 127 forces full
+    /// scale. Applied as a multiplier on the underlying sustain_percent
+    /// so DS / SFZ authors keep their authored mix while users have a
+    /// global "hold the note up" knob.
+    pub sustain: Option<u8>,
 }
 
 /// How a voice should be released.
@@ -97,6 +111,8 @@ impl VoiceControlData {
             envelope: EnvelopeControlData {
                 attack: None,
                 release: None,
+                decay: None,
+                sustain: None,
             },
         }
     }

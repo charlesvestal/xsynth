@@ -207,6 +207,21 @@ impl VoiceChannel {
                     self.voice_control_data.envelope.attack = Some(value);
                     self.propagate_voice_controls();
                 }
+                // MOVE FORK / 2026-05-19: CC75 = Sound Controller 6 (commonly
+                // mapped to Decay Time in GM2). Live decay multiplier.
+                0x4B => {
+                    self.voice_control_data.envelope.decay = Some(value);
+                    self.propagate_voice_controls();
+                }
+                // MOVE FORK / 2026-05-19: CC79 = Sound Controller 10
+                // (unassigned in GM but commonly used for "Custom Time").
+                // We claim it for sustain level — no widely-used CC for
+                // sustain exists, and CC79 is the highest unassigned
+                // sound-controller slot.
+                0x4F => {
+                    self.voice_control_data.envelope.sustain = Some(value);
+                    self.propagate_voice_controls();
+                }
                 0x4A => {
                     // Cutoff
                     if value < 64 {

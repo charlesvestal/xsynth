@@ -17,6 +17,13 @@ pub enum FilterType {
 
     /// Second order band pass filter
     BandPass,
+
+    /// MOVE FORK / 2026-05-19: Second order notch (band-reject).
+    /// Standard biquad Type::Notch — attenuates the cutoff frequency
+    /// and leaves all others through. SFZ `brf_2p` opcode. DS
+    /// converter emits this for `<effect type="notch">` instead of
+    /// collapsing to bpf (which inverted the spectral shape).
+    Notch,
 }
 
 /// Type of looping for a sample.

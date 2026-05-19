@@ -109,6 +109,19 @@ pub enum SfzOpcode {
     Tune(i16),
     AmpegEnvelope(SfzAmpegEnvelope),
     Trigger(TriggerType),
+    /// MOVE FORK / 2026-05-19: SFZ `polyphony=N` opcode. Max
+    /// simultaneous voices for the enclosing scope. We collect the
+    /// minimum value across all regions of a soundfont as the author's
+    /// declared cap.
+    Polyphony(u32),
+    /// MOVE FORK / 2026-05-19: SFZ `group=N` opcode — this region
+    /// belongs to choke group N. Distinct from the `<group>` SECTION
+    /// header (SfzGroupType::Group) — same word, different concept in
+    /// SFZ spec.
+    SfzGroup(u32),
+    /// MOVE FORK / 2026-05-19: SFZ `off_by=N` opcode — this region's
+    /// note-on chokes voices currently playing from group N.
+    SfzOffBy(u32),
     SeqLength(u32),
     SeqPosition(u32),
     /// MOVE FORK: ARIA `set_cc<N>=v` or `set_hdcc<N>=v`. Stores the
@@ -374,6 +387,9 @@ fn parse_filter_kind(val: &str) -> Option<FilterType> {
         "hpf_6p" => Some(FilterType::HighPass),
         "bpf_1p" => Some(FilterType::BandPass),
         "bpf_2p" => Some(FilterType::BandPass),
+        // MOVE FORK / 2026-05-19: notch / band-reject filter. SFZ spec
+        // uses `brf_2p`; xsynth maps to biquad's Type::Notch.
+        "brf_1p" | "brf_2p" => Some(FilterType::Notch),
         _ => None,
     }
 }
@@ -696,6 +712,23 @@ fn parse_sfz_opcode(
         "default_path" | "prefix_sfz_path"
             => Some(DefaultPath(val.replace('\\', "/"))),
         "tune" => parse_i16_in_range(val, -2400..=2400).map(Tune),
+        // MOVE FORK / 2026-05-19: SFZ `polyphony=N` opcode. Declares the
+        // maximum simultaneous voices for the enclosing scope. Stored on
+        // the region (and inherited from group/master/global like other
+        // opcodes); xsynth-core's SampleSoundfont surfaces the minimum
+        // across all regions as the "preset author's polyphony intent",
+        // which the C plugin uses to override the auto-heuristic when
+        // the author explicitly set a monophonic (or other narrow) cap.
+        "polyphony" => parse_u32_in_range(val, 1..=128).map(Polyphony),
+        // MOVE FORK / 2026-05-19: SFZ choke groups.
+        //   group=N    — this region belongs to group N.
+        //   off_by=N   — this region's note-on chokes group-N voices.
+        // Maps to xsynth-core's exclusive_class field (existing SF2
+        // chokeGroup mechanism). Both opcodes accept 0..=4_294_967_295
+        // in spec but we cap at u8 — the SF2 underlying field is u8 —
+        // and skip group=0 (the "no group" sentinel in SFZ).
+        "group" => parse_u32_in_range(val, 0..=u32::MAX).map(SfzGroup),
+        "off_by" | "offBy" => parse_u32_in_range(val, 0..=u32::MAX).map(SfzOffBy),
         "trigger" => parse_trigger(val).map(Trigger),
         "seq_length" | "seqlength" => parse_u32_in_range(val, 0..=255).map(SeqLength),
         "seq_position" | "seqposition" => parse_u32_in_range(val, 0..=255).map(SeqPosition),

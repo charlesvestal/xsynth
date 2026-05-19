@@ -39,6 +39,18 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     amp: f32,
     pan: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
+    /// MOVE FORK / 2026-05-19: source descriptor + envelope options +
+    /// per-region ampeg_*_oncc deltas. When any oncc list is non-empty,
+    /// apply_envelope rebuilds EnvelopeParameters at voice spawn from
+    /// `descriptor` + cc_state — same code path used by the global
+    /// Atk/Dec/Sus/Rel knobs, just with author-defined ranges instead
+    /// of CC72/73/75/79 unity offsets.
+    envelope_descriptor: crate::voice::EnvelopeDescriptor,
+    envelope_options: crate::soundfont::EnvelopeOptions,
+    ampeg_attack_oncc:  Arc<[(u8, f32, f32)]>,
+    ampeg_decay_oncc:   Arc<[(u8, f32, f32)]>,
+    ampeg_sustain_oncc: Arc<[(u8, f32, f32)]>,
+    ampeg_release_oncc: Arc<[(u8, f32, f32)]>,
     sample_source: SampleSource,
     interpolator: Interpolator,
     exclusive_class: Option<u8>,
@@ -118,6 +130,12 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             amp,
             pan: params.pan,
             volume_envelope_params: params.envelope.clone(),
+            envelope_descriptor: params.envelope_descriptor,
+            envelope_options: params.envelope_options,
+            ampeg_attack_oncc:  params.ampeg_attack_oncc.clone(),
+            ampeg_decay_oncc:   params.ampeg_decay_oncc.clone(),
+            ampeg_sustain_oncc: params.ampeg_sustain_oncc.clone(),
+            ampeg_release_oncc: params.ampeg_release_oncc.clone(),
             sample_source: params.sample.clone(),
             interpolator: params.interpolator,
             exclusive_class: params.exclusive_class,
@@ -310,14 +328,48 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         &self,
         gen: Gen,
         control: &VoiceControlData,
+        cc_state: &CcState,
     ) -> impl SIMDVoiceGenerator<S, Sample>
     where
         Sample: SIMDSample<S>,
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
+        // MOVE FORK / 2026-05-19: when this region has any ampeg_*_oncc
+        // bindings, recompute the envelope from base descriptor +
+        // live CC state at note-on time. Otherwise use the precomputed
+        // params (zero allocation, identical behavior to pre-fork).
+        let has_oncc = !self.ampeg_attack_oncc.is_empty()
+            || !self.ampeg_decay_oncc.is_empty()
+            || !self.ampeg_sustain_oncc.is_empty()
+            || !self.ampeg_release_oncc.is_empty();
+        let base_params = if has_oncc {
+            let mut desc = self.envelope_descriptor;
+            let extra = |list: &[(u8, f32, f32)]| -> f32 {
+                let mut acc = 0.0_f32;
+                for &(cc, value, cc_init) in list.iter() {
+                    let cc_norm = cc_state[cc as usize]
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        as f32
+                        / 127.0;
+                    acc += value * (cc_norm - cc_init);
+                }
+                acc
+            };
+            desc.attack          = (desc.attack          + extra(&self.ampeg_attack_oncc)).max(0.0);
+            desc.decay           = (desc.decay           + extra(&self.ampeg_decay_oncc)).max(0.0);
+            desc.sustain_percent = (desc.sustain_percent + extra(&self.ampeg_sustain_oncc)).clamp(0.0, 1.0);
+            desc.release         = (desc.release         + extra(&self.ampeg_release_oncc)).max(0.0);
+            desc.to_envelope_params(
+                self.stream_params.sample_rate,
+                self.envelope_options,
+            )
+        } else {
+            *self.volume_envelope_params.clone()
+        };
+
         let modified_params = SIMDVoiceEnvelope::<S>::get_modified_envelope(
-            *self.volume_envelope_params.clone(),
+            base_params,
             control.envelope,
             self.stream_params.sample_rate as f32,
         );
@@ -325,7 +377,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let allow_release = self.loop_params.mode != LoopMode::OneShot;
 
         let volume_envelope = SIMDVoiceEnvelope::new(
-            *self.volume_envelope_params.clone(),
+            base_params,
             modified_params,
             allow_release,
             self.stream_params.sample_rate as f32,
@@ -358,7 +410,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let gen = self.apply_volume_oncc(gen, cc_state);
         let gen = self.apply_amp_lfo(gen, cc_state);
         let gen = self.apply_pan(gen, cc_state);
-        let gen = self.apply_envelope(gen, control);
+        let gen = self.apply_envelope(gen, control, cc_state);
 
         self.apply_cutoff_effect(gen, cc_state)
     }

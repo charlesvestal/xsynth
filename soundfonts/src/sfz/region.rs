@@ -138,6 +138,17 @@ pub(crate) struct RegionParamsBuilder {
     ampeg_envelope: AmpegEnvelopeParams,
     tune: i16,
     trigger: TriggerType,
+    /// MOVE FORK / 2026-05-19: SFZ `polyphony=N` opcode. None = not
+    /// declared by the author. Soundfont collects the minimum value
+    /// across all regions and surfaces it so the plugin can honor a
+    /// monophonic SFZ (e.g. polyphony=1 at <global>).
+    polyphony: Option<u32>,
+    /// MOVE FORK / 2026-05-19: SFZ choke-group membership. None when
+    /// the author didn't declare `group=`. See build() for how this
+    /// collapses to an exclusive_class u8.
+    choke_group: Option<u32>,
+    /// MOVE FORK / 2026-05-19: SFZ `off_by=` — choking target group.
+    choke_off_by: Option<u32>,
     seq_length: u32,
     seq_position: u32,
     /// MOVE FORK: per-CC range gates. `(lo, hi)` per CC number; region
@@ -260,6 +271,9 @@ impl Default for RegionParamsBuilder {
             ampeg_envelope: AmpegEnvelopeParams::default(),
             tune: 0,
             trigger: TriggerType::Attack,
+            polyphony: None,
+            choke_group: None,
+            choke_off_by: None,
             seq_length: 0,
             seq_position: 0,
             cc_ranges: HashMap::new(),
@@ -393,6 +407,24 @@ impl RegionParamsBuilder {
             SfzOpcode::DefaultPath(val) => self.default_path = Some(val),
             SfzOpcode::AmpegEnvelope(flag) => self.ampeg_envelope.update_from_flag(flag),
             SfzOpcode::Tune(val) => self.tune = val,
+            SfzOpcode::Polyphony(val) => self.polyphony = Some(val),
+            // MOVE FORK / 2026-05-19: choke-group plumbing.
+            // SFZ semantics:
+            //   group=N    — region is a member of group N (0 = none)
+            //   off_by=N   — note-on on this region chokes group N voices
+            // We map both to a single u8 "exclusive_class" at build()
+            // time using off_by if set (so the spawning region kills
+            // the target group), else group (so the region's voice is
+            // a target of others' off_by). The typical symmetric pattern
+            // (group=1 off_by=1 on two regions) reduces to "same class
+            // → mutually choke", matching the SF2 chokeGroup mechanism
+            // xsynth already implements.
+            SfzOpcode::SfzGroup(val) => {
+                if val > 0 { self.choke_group = Some(val); }
+            }
+            SfzOpcode::SfzOffBy(val) => {
+                if val > 0 { self.choke_off_by = Some(val); }
+            }
             SfzOpcode::Trigger(val) => self.trigger = val,
             SfzOpcode::SeqLength(val) => self.seq_length = val,
             SfzOpcode::SeqPosition(val) => self.seq_position = val,
@@ -633,6 +665,26 @@ impl RegionParamsBuilder {
             ampeg_envelope: self.ampeg_envelope,
             tune: self.tune,
             trigger: self.trigger,
+            polyphony: self.polyphony,
+            // MOVE FORK / 2026-05-19: only set exclusive_class for the
+            // SYMMETRIC choke pattern (group=N off_by=N on the same
+            // region — typical closed/open hi-hat). xsynth's
+            // exclusive_class mechanism conflates "I kill class X" with
+            // "I'm in class X" into a single u8, so the asymmetric SFZ
+            // case (off_by without matching group, or off_by != group)
+            // collapses to broken self-choking: every region of the
+            // off_by'd group ends up mutually killing each other.
+            // For asymmetric chokes we'd need a real two-field model
+            // (TODO); for now we drop the choke quietly rather than
+            // breaking polyphony. RJS Classic Electric's
+            // `tags="sustain" silencedByTags="legato"` lands here —
+            // sustain regions go choke-less (polyphonic) and the
+            // legato choke is a no-op (legato samples themselves are
+            // filtered out earlier via the trigger=legato gate).
+            exclusive_class: match (self.choke_off_by, self.choke_group) {
+                (Some(o), Some(g)) if o == g => Some((o & 0xff) as u8),
+                _ => None,
+            },
             seq_length: self.seq_length,
             seq_position: self.seq_position,
             volume_oncc: self.volume_oncc,
@@ -724,6 +776,16 @@ pub struct RegionParams {
     pub ampeg_envelope: AmpegEnvelopeParams,
     pub tune: i16,
     pub trigger: TriggerType,
+    /// MOVE FORK / 2026-05-19: SFZ `polyphony=N` opcode (None = author
+    /// didn't declare). Soundfont aggregates min across all regions and
+    /// the plugin uses it to override the auto-heuristic when present.
+    pub polyphony: Option<u32>,
+    /// MOVE FORK / 2026-05-19: SFZ `group=` + `off_by=` mapped down to
+    /// a single u8 exclusive_class. xsynth-core's voice spawn checks
+    /// `exclusive_class` and kills any prior voices that share it —
+    /// covers the typical "open/closed hi-hat" SFZ choke pattern
+    /// (both regions group=1 off_by=1) directly. None = no choke.
+    pub exclusive_class: Option<u8>,
     /// MOVE FORK: SFZ round-robin opcodes. `seq_length` is the total
     /// number of RR variations (0 = no RR). `seq_position` is this
     /// region's 1-based slot in the sequence (0 = always-fire, ignored
