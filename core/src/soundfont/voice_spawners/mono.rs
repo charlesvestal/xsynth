@@ -231,14 +231,17 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             let extra = |list: &[(u8, f32, f32)]| -> f32 {
                 let mut acc = 0.0_f32;
                 for &(cc, value, cc_init) in list.iter() {
-                    let cc_norm = cc_state[cc as usize]
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        as f32
-                        / 127.0;
-                    acc += value * (cc_norm - cc_init);
+                    if (cc as usize) < 128 {
+                        let cc_norm = cc_state[cc as usize]
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as f32
+                            / 127.0;
+                        acc += value * (cc_norm - cc_init);
+                    }
                 }
                 acc
             };
+
             desc.attack          = (desc.attack          + extra(&self.ampeg_attack_oncc)).max(0.0);
             desc.decay           = (desc.decay           + extra(&self.ampeg_decay_oncc)).max(0.0);
             desc.sustain_percent = (desc.sustain_percent + extra(&self.ampeg_sustain_oncc)).clamp(0.0, 1.0);
