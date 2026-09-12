@@ -122,4 +122,109 @@ sample=samples/tone.wav
 
         fs::remove_dir_all(dir).unwrap();
     }
+
+    /// MOVE FORK / 2026-09-12: ARIA extended CCs (>= 128). The runtime
+    /// binding must NOT be recorded — `CcState` is 128 atomics, so it
+    /// would panic at voice spawn — but the static bake against
+    /// `set_hdcc<N>` MUST still happen, because that is the whole
+    /// envelope for libraries like Splendid Grand Piano. Dropping the
+    /// opcode at parse satisfies the first half and silently breaks the
+    /// second: the instrument loads, plays, and has the wrong decay.
+    #[test]
+    fn aria_oncc_above_127_bakes_statically_and_binds_nothing() {
+        let dir = create_temp_dir("oncc-extended");
+        let sfz_path = dir.join("instrument.sfz");
+        let sample_path = dir.join("samples").join("tone.wav");
+
+        write(&sample_path, "");
+        write(
+            &sfz_path,
+            r#"
+<control>
+set_hdcc133=0.5
+<group>
+ampeg_decay=1.0
+ampeg_decay_oncc133=-0.6
+<region>
+sample=samples/tone.wav
+"#,
+        );
+
+        let regions = parse_soundfont(&sfz_path).unwrap();
+
+        assert_eq!(regions.len(), 1);
+        // 1.0 + (-0.6 * 0.5)
+        assert!(
+            (regions[0].ampeg_envelope.ampeg_decay - 0.7).abs() < 1e-6,
+            "extended-CC contribution was not folded into the base: {}",
+            regions[0].ampeg_envelope.ampeg_decay
+        );
+        assert!(
+            regions[0].ampeg_decay_oncc.is_empty(),
+            "CC >= 128 must not reach the runtime list: {:?}",
+            regions[0].ampeg_decay_oncc
+        );
+    }
+
+    /// The control: an ordinary CC keeps BOTH halves, so the guard above
+    /// cannot be widened into "extended CCs are just dropped".
+    #[test]
+    fn aria_oncc_below_128_bakes_and_binds() {
+        let dir = create_temp_dir("oncc-ordinary");
+        let sfz_path = dir.join("instrument.sfz");
+        let sample_path = dir.join("samples").join("tone.wav");
+
+        write(&sample_path, "");
+        write(
+            &sfz_path,
+            r#"
+<control>
+set_hdcc72=0.5
+<group>
+ampeg_decay=1.0
+ampeg_decay_oncc72=-0.6
+<region>
+sample=samples/tone.wav
+"#,
+        );
+
+        let regions = parse_soundfont(&sfz_path).unwrap();
+
+        assert_eq!(regions.len(), 1);
+        assert!((regions[0].ampeg_envelope.ampeg_decay - 0.7).abs() < 1e-6);
+        assert_eq!(regions[0].ampeg_decay_oncc.len(), 1);
+        let (cc, value, cc_init) = regions[0].ampeg_decay_oncc[0];
+        assert_eq!(cc, 72);
+        assert!((value - -0.6).abs() < 1e-6);
+        assert!((cc_init - 0.5).abs() < 1e-6);
+    }
+
+    /// Live (non-ampeg) `_oncc` bases have no static bake at all, so an
+    /// extended CC there is dropped outright rather than half-applied.
+    #[test]
+    fn live_oncc_above_127_is_dropped() {
+        let dir = create_temp_dir("oncc-live-extended");
+        let sfz_path = dir.join("instrument.sfz");
+        let sample_path = dir.join("samples").join("tone.wav");
+
+        write(&sample_path, "");
+        write(
+            &sfz_path,
+            r#"
+<control>
+set_hdcc133=0.5
+<group>
+volume_oncc133=6
+pan_oncc133=50
+<region>
+sample=samples/tone.wav
+"#,
+        );
+
+        let regions = parse_soundfont(&sfz_path).unwrap();
+
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].volume_oncc.is_empty());
+        assert!(regions[0].pan_oncc.is_empty());
+    }
 }

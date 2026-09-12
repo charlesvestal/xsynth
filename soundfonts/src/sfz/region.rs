@@ -1008,6 +1008,16 @@ pub(super) fn parse_sf_root(
                         // stage transitions (note-on for atk/dec/sus, note-off
                         // for release). attack/decay/sustain/release only;
                         // hold/delay/start aren't exposed as live knobs.
+                        //
+                        // MOVE FORK / 2026-09-12: only for CC < 128. An
+                        // ARIA extended CC (Splendid Grand Piano's
+                        // `ampeg_decay_oncc133`) has no runtime half at
+                        // all: `CcState` holds 128 atomics and no MIDI
+                        // message can set CC >= 128, so its value is
+                        // frozen at `set_hdcc<N>` forever and the fold
+                        // above is already the exact answer. Recording
+                        // the binding would index out of bounds at voice
+                        // spawn — a panic on the audio thread at note-on.
                         let entry = (cc, value, cc_v);
                         fn upsert(v: &mut Vec<(u8, f32, f32)>, e: (u8, f32, f32)) {
                             if let Some(x) = v.iter_mut().find(|x| x.0 == e.0) {
@@ -1016,12 +1026,14 @@ pub(super) fn parse_sf_root(
                                 v.push(e);
                             }
                         }
-                        match base {
-                            AriaOnccBase::AmpegAttack  => upsert(&mut group_data.ampeg_attack_oncc,  entry),
-                            AriaOnccBase::AmpegDecay   => upsert(&mut group_data.ampeg_decay_oncc,   entry),
-                            AriaOnccBase::AmpegSustain => upsert(&mut group_data.ampeg_sustain_oncc, entry),
-                            AriaOnccBase::AmpegRelease => upsert(&mut group_data.ampeg_release_oncc, entry),
-                            _ => {}
+                        if cc < 128 {
+                            match base {
+                                AriaOnccBase::AmpegAttack  => upsert(&mut group_data.ampeg_attack_oncc,  entry),
+                                AriaOnccBase::AmpegDecay   => upsert(&mut group_data.ampeg_decay_oncc,   entry),
+                                AriaOnccBase::AmpegSustain => upsert(&mut group_data.ampeg_sustain_oncc, entry),
+                                AriaOnccBase::AmpegRelease => upsert(&mut group_data.ampeg_release_oncc, entry),
+                                _ => {}
+                            }
                         }
                     }
                 }
