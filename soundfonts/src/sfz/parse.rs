@@ -519,7 +519,30 @@ fn parse_sfz_opcode(
         let base_name = &name[..idx];
         let cc_part = &name[idx + "_oncc".len()..];
         if let Ok(cc_n) = cc_part.parse::<u8>() {
-            if cc_n >= 128 {
+            let ampeg_base = match base_name {
+                "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
+                "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
+                "ampeg_decay" => Some(AriaOnccBase::AmpegDecay),
+                "ampeg_sustain" => Some(AriaOnccBase::AmpegSustain),
+                "ampeg_release" | "ampeg_releasecc" => Some(AriaOnccBase::AmpegRelease),
+                "ampeg_delay" => Some(AriaOnccBase::AmpegDelay),
+                "ampeg_start" => Some(AriaOnccBase::AmpegStart),
+                _ => None,
+            };
+            // MOVE FORK / 2026-09-12: ARIA extended CCs. `_oncc<N>` accepts
+            // N up to 255 (Splendid Grand Piano ships
+            // `ampeg_decay_oncc133`), but `CcState` is 128 atomics and no
+            // MIDI message can ever set CC >= 128 — so a LIVE binding on
+            // one is both unreachable and an out-of-bounds index at voice
+            // spawn. Drop those here.
+            //
+            // `ampeg_*` is the exception and must NOT be dropped: it is
+            // baked statically against the control block's `set_hdcc<N>`
+            // in `parse_sf_root`, which is the whole reason that piano's
+            // envelopes come out right. `region.rs` keeps the fold and
+            // skips only the runtime half. Dropping the opcode here
+            // instead would load and play — with a silently wrong decay.
+            if cc_n >= 128 && ampeg_base.is_none() {
                 return Ok(None);
             }
             // Live binding: stored on the region, sampled at render time.
@@ -604,17 +627,7 @@ fn parse_sfz_opcode(
                 }
                 return Ok(None);
             }
-            let base = match base_name {
-                "ampeg_attack" => Some(AriaOnccBase::AmpegAttack),
-                "ampeg_hold" => Some(AriaOnccBase::AmpegHold),
-                "ampeg_decay" => Some(AriaOnccBase::AmpegDecay),
-                "ampeg_sustain" => Some(AriaOnccBase::AmpegSustain),
-                "ampeg_release" | "ampeg_releasecc" => Some(AriaOnccBase::AmpegRelease),
-                "ampeg_delay" => Some(AriaOnccBase::AmpegDelay),
-                "ampeg_start" => Some(AriaOnccBase::AmpegStart),
-                _ => None,
-            };
-            if let Some(base) = base {
+            if let Some(base) = ampeg_base {
                 if let Ok(v) = val.parse::<f32>() {
                     return Ok(Some(AriaOncc { base, cc: cc_n, value: v }));
                 }
