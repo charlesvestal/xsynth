@@ -519,6 +519,9 @@ fn parse_sfz_opcode(
         let base_name = &name[..idx];
         let cc_part = &name[idx + "_oncc".len()..];
         if let Ok(cc_n) = cc_part.parse::<u8>() {
+            if cc_n >= 128 {
+                return Ok(None);
+            }
             // Live binding: stored on the region, sampled at render time.
             if base_name == "volume" {
                 if let Ok(v) = val.parse::<f32>() {
@@ -627,6 +630,9 @@ fn parse_sfz_opcode(
         let base_name = &name[..idx];
         let cc_part = &name[idx + "_curvecc".len()..];
         if let Ok(cc_n) = cc_part.parse::<u8>() {
+            if cc_n >= 128 {
+                return Ok(None);
+            }
             if let Ok(curve_id) = val.parse::<u8>() {
                 match base_name {
                     "volume" => return Ok(Some(VolumeCurvecc(cc_n, curve_id))),
@@ -639,6 +645,7 @@ fn parse_sfz_opcode(
         }
         return Ok(None);
     }
+
     // MOVE FORK: <curve> block opcodes.
     if name == "index" {
         if let Ok(id) = val.parse::<u8>() {
