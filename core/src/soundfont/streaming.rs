@@ -861,6 +861,19 @@ fn pool_thread(rx: Receiver<PoolCommand>) {
         libc::CPU_SET(1, &mut set);
         libc::CPU_SET(2, &mut set);
         let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+
+        // MOVE FORK / 2026-10-03: ASK for realtime rather than inherit it.
+        // The render reads the rings this thread refills, so it must keep up
+        // under load -- and what it inherited depended on which thread loaded
+        // the preset: SCHED_FIFO 70 from a host that builds modules on the
+        // SPI callback, SCHED_OTHER from one that builds them on a background
+        // loader (Schwung's slot loader), or from a later preset change. 20
+        // is the fleet's choice for module workers: realtime, but below
+        // Move's own Link Main (35) and its audio threads (70). The process
+        // has CAP_SYS_NICE, so this succeeds on the device; refused, the
+        // worker carries on at its inherited policy.
+        let param = libc::sched_param { sched_priority: 20 };
+        let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
     }
 
     let mut working_set: Vec<RegisteredRing> = Vec::with_capacity(64);

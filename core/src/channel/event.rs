@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use crate::soundfont::SoundfontBase;
 
+use super::channel_sf::PrebuiltMatrix;
+
 /// MIDI events for a single key in a channel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -26,6 +28,11 @@ pub enum ChannelConfigEvent {
     /// Sets the soundfonts for the channel
     #[cfg_attr(feature = "serde", serde(skip))]
     SetSoundfonts(Vec<Arc<dyn SoundfontBase>>),
+
+    /// MOVE FORK / 2026-10-03: soundfonts plus a spawner matrix already
+    /// built for them off the audio thread (see `build_spawner_matrix`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    SetSoundfontsPrebuilt(Vec<Arc<dyn SoundfontBase>>, PrebuiltMatrix),
 
     /// Sets the layer count for the soundfont
     SetLayerCount(Option<usize>),
