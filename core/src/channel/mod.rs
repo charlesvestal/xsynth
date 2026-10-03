@@ -34,7 +34,10 @@ mod voice_spawner;
 
 mod event;
 pub use event::*;
-pub use channel_sf::SoundfontDropSink;
+pub use channel_sf::{
+    build_spawner_matrix, MatrixDropSink, PrebuiltMatrix, ProgramDescriptor, SoundfontDropSink,
+};
+pub use voice_spawner::VoiceSpawnerMatrix;
 
 pub(crate) use control::ValueLerp;
 pub use params::VoiceChannelStatsReader;

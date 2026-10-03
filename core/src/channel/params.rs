@@ -69,6 +69,9 @@ impl VoiceChannelParams {
             ChannelConfigEvent::SetSoundfonts(soundfonts) => {
                 self.channel_sf.set_soundfonts(soundfonts)
             }
+            ChannelConfigEvent::SetSoundfontsPrebuilt(soundfonts, prebuilt) => {
+                self.channel_sf.set_soundfonts_prebuilt(soundfonts, prebuilt)
+            }
             ChannelConfigEvent::SetLayerCount(count) => {
                 self.layers = count;
             }
